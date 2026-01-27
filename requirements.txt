@@ -1,0 +1,6 @@
+# TRUF Network SDK
+# Install from source: pip install git+https://github.com/trufnetwork/sdk-py.git
+# Or build locally with Python 3.12 and Go 1.22+
+
+# Optional: For key generation
+eth-account>=0.8.0
