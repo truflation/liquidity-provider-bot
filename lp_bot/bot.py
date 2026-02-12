@@ -228,6 +228,33 @@ class LiquidityProviderBot:
             f"with bounds ±{stream_config.bounds_pct*100:.0f}% from mid"
         )
 
+    def discover_markets(self, limit: int = 50) -> list[int]:
+        """
+        Discover active (non-settled) markets from the network.
+
+        Args:
+            limit: Maximum number of markets to fetch
+
+        Returns:
+            List of query_ids for active markets
+        """
+        try:
+            markets = self.client.list_markets(limit=limit)
+            active_ids = []
+            for m in markets:
+                # Markets are dicts with keys: id, settled, settle_time, etc.
+                settled = m.get("settled", False) if isinstance(m, dict) else getattr(m, "settled", False)
+                if settled:
+                    continue
+                qid = m.get("id") if isinstance(m, dict) else getattr(m, "id", None)
+                if qid is not None:
+                    active_ids.append(int(qid))
+            logger.info(f"Discovered {len(active_ids)} active markets (out of {len(markets)} total)")
+            return active_ids
+        except Exception as e:
+            logger.error(f"Failed to discover markets: {e}")
+            return []
+
     def get_market_state(self, query_id: int, outcome: bool = True) -> MarketState:
         """
         Fetch current market state from the order book.
@@ -254,9 +281,14 @@ class LiquidityProviderBot:
         # Fetch from network
         try:
             order_book = self.client.get_order_book(query_id, outcome)
+            return build_market_state(
+                query_id=query_id,
+                outcome=outcome,
+                order_book_entries=order_book,
+                current_time=time.time(),
+            )
         except Exception as e:
-            logger.error(f"Failed to fetch order book for market {query_id}: {e}")
-            # Return empty market state
+            logger.error(f"Failed to fetch market state for {query_id}: {e}")
             return MarketState(
                 query_id=query_id,
                 outcome=outcome,
@@ -265,12 +297,6 @@ class LiquidityProviderBot:
                 bid_levels=[],
                 ask_levels=[],
             )
-        return build_market_state(
-            query_id=query_id,
-            outcome=outcome,
-            order_book_entries=order_book,
-            current_time=time.time(),
-        )
 
     def calculate_target_prices(
         self,
@@ -467,26 +493,27 @@ class LiquidityProviderBot:
         except Exception as e:
             logger.error(f"Failed to place bid order: {e}")
 
-        # Place ask order
+        # Place ask order via split limit order (mints pairs, sells unwanted side)
+        # place_split_limit_order(true_price=X) creates a NO ask at (100-X),
+        # which is economically equivalent to a YES ask at X.
         try:
-            tx_hash = self.client.place_sell_order(
+            tx_hash = self.client.place_split_limit_order(
                 query_id=context.query_id,
-                outcome=outcome,
-                price=ask_price_int,
+                true_price=ask_price_int,
                 amount=amount,
                 wait=True,
             )
             ask_order = ActiveOrder(
                 query_id=context.query_id,
-                outcome=outcome,
+                outcome=not outcome,  # Split order is on the opposite side
                 side="ask",
-                price=ask_price_int,  # SDK format
+                price=100 - ask_price_int,  # NO side price
                 amount=amount,
             )
             placed_orders.append(ask_order)
             logger.info(
-                f"Placed ask at {ask_price_int} for {amount} shares "
-                f"on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                f"Placed ask at {ask_price_int} (split order, NO@{100-ask_price_int}) "
+                f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
             )
         except Exception as e:
             logger.error(f"Failed to place ask order: {e}")

@@ -47,7 +47,7 @@ class StreamConfig:
 class Config:
     """Main configuration for the LP Bot."""
     # TRUF Network connection
-    node_url: str = "https://gateway.mainnet.truf.network"
+    node_url: str = "https://gateway.testnet.truf.network"
     api_token: str = ""  # Optional - only needed for placing orders, not for reading data
 
     # Use sample data instead of real network data (for testing)
@@ -85,13 +85,13 @@ def get_default_streams() -> list[StreamConfig]:
     """
     Get default stream configurations with bounds as percentage from mid.
 
-    Stream IDs provided by user:
-    - st1e321de22ece39a258bc2588dd2871 - US Inflation YoY
-    - st8f1e62d3a130572ec468dda082f889 - US CPI Index
-    - st1d6d41423cd9746a81ea6063b1345e - US CPI Index Alt
-    - ste03c2844c591a10d8a524d14d23066 - EU Inflation YoY
-    - ste909219dce3f693c61a0f187758fb0 - EU CPI Index
-    - stf6584cf470744723c90130130cb7db - Egg Price
+    Testnet streams (matching market creation bot config):
+    - st9058219c3c3247faf2b0a738de7027 - Testnet BTC-like Price
+    - st5cda3b42dc3db0e49af57d7bf14905 - Testnet Mid-Cap Price
+    - st361547d8b439502d3828d74ca679b5 - Testnet Low-Cap Price
+    - st26e6f725c82630d2c5bd542883453f - Testnet Rate A
+    - stf826b74de25bcae10dcde294c25e87 - Testnet Rate B
+    - stde38e5fd701194ef8da203c8fb012b - Testnet Mid-Range Price
 
     bounds_pct: Percentage from mid price for rewards-eligible bounds.
     E.g., 0.10 means bounds are at mid ± 10%
@@ -99,33 +99,33 @@ def get_default_streams() -> list[StreamConfig]:
     """
     return [
         StreamConfig(
-            stream_id="st1e321de22ece39a258bc2588dd2871",
-            name="US Inflation YoY",
+            stream_id="st9058219c3c3247faf2b0a738de7027",
+            name="Testnet BTC-like Price",
             bounds_pct=0.10,  # ±10% from mid
         ),
         StreamConfig(
-            stream_id="st8f1e62d3a130572ec468dda082f889",
-            name="US CPI Index",
+            stream_id="st5cda3b42dc3db0e49af57d7bf14905",
+            name="Testnet Mid-Cap Price",
             bounds_pct=0.10,
         ),
         StreamConfig(
-            stream_id="st1d6d41423cd9746a81ea6063b1345e",
-            name="US CPI Index Alt",
+            stream_id="st361547d8b439502d3828d74ca679b5",
+            name="Testnet Low-Cap Price",
             bounds_pct=0.10,
         ),
         StreamConfig(
-            stream_id="ste03c2844c591a10d8a524d14d23066",
-            name="EU Inflation YoY",
+            stream_id="st26e6f725c82630d2c5bd542883453f",
+            name="Testnet Rate A",
             bounds_pct=0.10,
         ),
         StreamConfig(
-            stream_id="ste909219dce3f693c61a0f187758fb0",
-            name="EU CPI Index",
+            stream_id="stf826b74de25bcae10dcde294c25e87",
+            name="Testnet Rate B",
             bounds_pct=0.10,
         ),
         StreamConfig(
-            stream_id="stf6584cf470744723c90130130cb7db",
-            name="Egg Price",
+            stream_id="stde38e5fd701194ef8da203c8fb012b",
+            name="Testnet Mid-Range Price",
             bounds_pct=0.15,  # ±15% from mid (more volatile)
         ),
     ]
@@ -136,7 +136,7 @@ def load_config_from_env() -> Config:
     import os
 
     config = Config(
-        node_url=os.getenv("TRUF_NODE_URL", "https://gateway.mainnet.truf.network"),
+        node_url=os.getenv("TRUF_NODE_URL", "https://gateway.testnet.truf.network"),
         api_token=os.getenv("TRUF_API_TOKEN", ""),
         alpha=float(os.getenv("LP_BOT_ALPHA", "0.30")),
         default_order_amount=int(os.getenv("LP_BOT_ORDER_AMOUNT", "100")),

@@ -4,11 +4,12 @@ Main entry point for the Liquidity Provider Bot.
 
 Usage:
     # Using environment variables:
-    export TRUF_NODE_URL="https://gateway.mainnet.truf.network"
-    export TRUF_API_TOKEN="your-api-token"
-    export LP_BOT_ALPHA="0.30"
-    export LP_BOT_PRICING_METHOD="equal"  # or "volume"
-    python -m lp_bot.main
+    export TRUF_NODE_URL="https://gateway.testnet.truf.network"
+    export TRUF_API_TOKEN="your-private-key"
+    python -m lp_bot.main --query-ids 38,39,40 --dry-run
+
+    # Auto-discover active markets:
+    python -m lp_bot.main --discover-markets --dry-run
 
     # Or run directly with configuration in code.
 """
@@ -38,17 +39,20 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Run with default configuration from environment:
-    python -m lp_bot.main
+    # Provide liquidity to specific markets (dry run):
+    python -m lp_bot.main --query-ids 38,39,40 --dry-run
+
+    # Auto-discover active markets:
+    python -m lp_bot.main --discover-markets --dry-run
 
     # Run with custom alpha (risk tolerance):
-    python -m lp_bot.main --alpha 0.5
+    python -m lp_bot.main --query-ids 38 --alpha 0.5
 
     # Run with volume-weighted pricing and time decay:
-    python -m lp_bot.main --method volume --time-decay --half-life 30
+    python -m lp_bot.main --query-ids 38 --method volume --time-decay --half-life 30
 
     # Run in debug mode:
-    python -m lp_bot.main --debug
+    python -m lp_bot.main --query-ids 38 --debug
         """,
     )
 
@@ -118,6 +122,17 @@ Examples:
         "--sample-data",
         action="store_true",
         help="Use sample order book data instead of fetching from network",
+    )
+    parser.add_argument(
+        "--query-ids",
+        type=str,
+        default=None,
+        help="Comma-separated list of market query IDs to provide liquidity for (e.g. 38,39,40)",
+    )
+    parser.add_argument(
+        "--discover-markets",
+        action="store_true",
+        help="Auto-discover active (non-settled) markets from the network",
     )
 
     return parser.parse_args()
@@ -202,20 +217,47 @@ def register_example_markets(bot) -> None:
     """
     Register example markets for demonstration.
 
-    In production, you would:
-    1. Fetch available markets from the network
-    2. Match stream_ids to query_ids
-    3. Register markets with appropriate bounds
+    NOTE: This fallback registers no markets by default.
+    Use --query-ids or --discover-markets to specify markets.
     """
-    # Example: Register a market with query_id=1 using US Inflation config
-    # The query_id needs to be looked up based on the stream/market
-    example_markets = [
-        (1, bot.config.streams[0]),  # query_id=1 -> US Inflation YoY
-    ]
+    logger.warning(
+        "No markets specified. Use --query-ids or --discover-markets to target markets.\n"
+        "  Example: python -m lp_bot.main --query-ids 38,39,40 --dry-run\n"
+        "  Example: python -m lp_bot.main --discover-markets --dry-run"
+    )
 
-    for query_id, stream_config in example_markets:
-        if stream_config.enabled:
-            bot.register_market(query_id, stream_config)
+
+def register_query_ids(bot, query_ids: list[int]) -> None:
+    """
+    Register explicit query IDs with default stream config.
+
+    Args:
+        bot: LiquidityProviderBot instance
+        query_ids: List of query IDs to register
+    """
+    for qid in query_ids:
+        stream_config = StreamConfig(
+            stream_id="",  # Not needed for order placement — SDK uses query_id
+            name=f"Market #{qid}",
+            bounds_pct=0.10,
+            min_order_size=1,  # Let --order-amount control the size
+        )
+        bot.register_market(qid, stream_config)
+
+
+def register_discovered_markets(bot) -> None:
+    """
+    Auto-discover active markets from the network and register them.
+
+    Args:
+        bot: LiquidityProviderBot instance
+    """
+    query_ids = bot.discover_markets()
+    if not query_ids:
+        logger.warning("No active markets discovered on the network")
+        return
+    logger.info(f"Discovered markets: {query_ids}")
+    register_query_ids(bot, query_ids)
 
 
 def main() -> None:
@@ -291,10 +333,18 @@ def main() -> None:
     # Setup signal handlers for graceful shutdown
     setup_signal_handlers(bot)
 
-    # Register markets
-    # NOTE: In production, you would dynamically discover markets
-    # and map stream_ids to query_ids
-    register_example_markets(bot)
+    # Register markets based on CLI args
+    if args.query_ids:
+        try:
+            query_ids = [int(x.strip()) for x in args.query_ids.split(",")]
+        except ValueError:
+            logger.error(f"Invalid --query-ids format: {args.query_ids!r}. Expected comma-separated integers.")
+            sys.exit(1)
+        register_query_ids(bot, query_ids)
+    elif args.discover_markets:
+        register_discovered_markets(bot)
+    else:
+        register_example_markets(bot)
 
     if not bot.markets:
         logger.warning("No markets registered. Add markets to start providing liquidity.")
