@@ -252,12 +252,19 @@ def register_discovered_markets(bot) -> None:
     Args:
         bot: LiquidityProviderBot instance
     """
-    query_ids = bot.discover_markets()
-    if not query_ids:
+    discovered = bot.discover_markets()
+    if not discovered:
         logger.warning("No active markets discovered on the network")
         return
-    logger.info(f"Discovered markets: {query_ids}")
-    register_query_ids(bot, query_ids)
+    logger.info(f"Discovered {len(discovered)} markets")
+    for m in discovered:
+        stream_config = StreamConfig(
+            stream_id="",
+            name=f"Market #{m['id']}",
+            bounds_pct=0.10,
+            min_order_size=1,
+        )
+        bot.register_market(m["id"], stream_config, settle_time=m.get("settle_time"))
 
 
 def main() -> None:

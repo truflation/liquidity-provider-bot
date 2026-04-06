@@ -69,6 +69,9 @@ class Config:
     block_interval_seconds: float = 2.0  # Approximate block time
     check_interval_seconds: float = 5.0  # How often to check for new blocks
 
+    # Pre-settlement cutoff: pull all liquidity this many seconds before settle_time
+    pre_settlement_cutoff: float = 900.0  # Default 15 minutes
+
     # Configured streams with rewards-eligible bounds
     streams: list[StreamConfig] = field(default_factory=list)
 

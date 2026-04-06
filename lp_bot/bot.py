@@ -46,6 +46,7 @@ class MarketContext:
     stream_config: StreamConfig
     current_orders: list[ActiveOrder] = field(default_factory=list)
     last_update_block: int = 0
+    settle_time: Optional[int] = None
 
 
 @dataclass
@@ -211,24 +212,26 @@ class LiquidityProviderBot:
 
         logger.info(f"Wrote {len(self._snapshots)} market snapshots to {self.output_file}")
 
-    def register_market(self, query_id: int, stream_config: StreamConfig) -> None:
+    def register_market(self, query_id: int, stream_config: StreamConfig, settle_time: Optional[int] = None) -> None:
         """
         Register a market for liquidity provision.
 
         Args:
             query_id: The market's query ID
             stream_config: Configuration for this stream/market
+            settle_time: Optional settlement timestamp (for pre-settlement cutoff)
         """
         self.markets[query_id] = MarketContext(
             query_id=query_id,
             stream_config=stream_config,
+            settle_time=settle_time,
         )
         logger.info(
             f"Registered market {query_id} ({stream_config.name}) "
             f"with bounds ±{stream_config.bounds_pct*100:.0f}% from mid"
         )
 
-    def discover_markets(self, limit: int = 50) -> list[int]:
+    def discover_markets(self, limit: int = 50) -> list[dict]:
         """
         Discover active (non-settled) markets from the network.
 
@@ -236,21 +239,21 @@ class LiquidityProviderBot:
             limit: Maximum number of markets to fetch
 
         Returns:
-            List of query_ids for active markets
+            List of dicts with 'id' and 'settle_time' for active markets
         """
         try:
             markets = self.client.list_markets(limit=limit)
-            active_ids = []
+            active = []
             for m in markets:
-                # Markets are dicts with keys: id, settled, settle_time, etc.
                 settled = m.get("settled", False) if isinstance(m, dict) else getattr(m, "settled", False)
                 if settled:
                     continue
                 qid = m.get("id") if isinstance(m, dict) else getattr(m, "id", None)
+                st = m.get("settle_time") if isinstance(m, dict) else getattr(m, "settle_time", None)
                 if qid is not None:
-                    active_ids.append(int(qid))
-            logger.info(f"Discovered {len(active_ids)} active markets (out of {len(markets)} total)")
-            return active_ids
+                    active.append({"id": int(qid), "settle_time": st})
+            logger.info(f"Discovered {len(active)} active markets (out of {len(markets)} total)")
+            return active
         except Exception as e:
             logger.error(f"Failed to discover markets: {e}")
             return []
@@ -365,19 +368,40 @@ class LiquidityProviderBot:
             return
 
         for order in context.current_orders:
-            try:
-                self.client.cancel_order(
-                    query_id=order.query_id,
-                    outcome=order.outcome,
-                    price=order.price,
-                    wait=True,
-                )
-                logger.debug(
-                    f"Cancelled {order.side} order at {order.price} "
-                    f"for market {order.query_id}"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to cancel order: {e}")
+            if order.side == "ask":
+                # Ask orders exist on both sides (split mint + sell).
+                # Cancel NO-side and YES-side asks.
+                for cancel_outcome, cancel_price in [
+                    (order.outcome, order.price),
+                    (not order.outcome, 100 - order.price),
+                ]:
+                    try:
+                        self.client.cancel_order(
+                            query_id=order.query_id,
+                            outcome=cancel_outcome,
+                            price=cancel_price,
+                            wait=True,
+                        )
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if "order not found" in err_str or "old order not found" in err_str:
+                            logger.debug(f"Order already gone for market {order.query_id}")
+                        else:
+                            logger.warning(f"Failed to cancel ask order: {e}")
+            else:
+                try:
+                    self.client.cancel_order(
+                        query_id=order.query_id,
+                        outcome=order.outcome,
+                        price=order.price,
+                        wait=True,
+                    )
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "order not found" in err_str or "old order not found" in err_str:
+                        logger.debug(f"Order already gone for market {order.query_id}")
+                    else:
+                        logger.warning(f"Failed to cancel bid order: {e}")
 
         context.current_orders.clear()
 
@@ -493,26 +517,33 @@ class LiquidityProviderBot:
         except Exception as e:
             logger.error(f"Failed to place bid order: {e}")
 
-        # Place ask order via split limit order (mints pairs, sells unwanted side)
-        # place_split_limit_order(true_price=X) creates a NO ask at (100-X),
-        # which is economically equivalent to a YES ask at X.
+        # Place ask orders on BOTH sides of the book.
+        # 1. place_split_limit_order mints pairs and sells NO at (100 - true_price)
+        # 2. place_sell_order sells the retained YES shares as a YES ask
         try:
-            tx_hash = self.client.place_split_limit_order(
+            self.client.place_split_limit_order(
                 query_id=context.query_id,
                 true_price=ask_price_int,
                 amount=amount,
                 wait=True,
             )
+            tx_hash = self.client.place_sell_order(
+                query_id=context.query_id,
+                outcome=True,
+                price=ask_price_int,
+                amount=amount,
+                wait=True,
+            )
             ask_order = ActiveOrder(
                 query_id=context.query_id,
-                outcome=not outcome,  # Split order is on the opposite side
+                outcome=not outcome,  # Track as NO side (for cancel logic)
                 side="ask",
                 price=100 - ask_price_int,  # NO side price
                 amount=amount,
             )
             placed_orders.append(ask_order)
             logger.info(
-                f"Placed ask at {ask_price_int} (split order, NO@{100-ask_price_int}) "
+                f"Placed ask at {ask_price_int} (YES + NO@{100-ask_price_int}) "
                 f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
             )
         except Exception as e:
@@ -566,6 +597,18 @@ class LiquidityProviderBot:
 
         if not context.stream_config.enabled:
             return
+
+        # Pull liquidity before settlement to protect capital
+        if context.settle_time and self.config.pre_settlement_cutoff > 0:
+            seconds_left = context.settle_time - int(time.time())
+            if seconds_left <= self.config.pre_settlement_cutoff:
+                if context.current_orders:
+                    logger.info(
+                        f"Market {query_id}: within pre-settlement cutoff "
+                        f"({seconds_left}s left). Pulling liquidity."
+                    )
+                    self.cancel_existing_orders(context)
+                return
 
         try:
             # Fetch current market state
