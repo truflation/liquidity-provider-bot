@@ -33,10 +33,11 @@ logger = logging.getLogger(__name__)
 class ActiveOrder:
     """Tracks an active order placed by the bot."""
     query_id: int
-    outcome: bool
+    outcome: bool  # The outcome the order is tracked under (for asks: opposite of tracked_outcome)
     side: str  # "bid" or "ask"
     price: int  # SDK format (negative for bids, positive for asks)
     amount: int
+    tracked_outcome: bool = True  # Which logical outcome this order belongs to (YES or NO)
 
 
 @dataclass
@@ -355,19 +356,32 @@ class LiquidityProviderBot:
 
         return result
 
-    def cancel_existing_orders(self, context: MarketContext) -> None:
+    def cancel_existing_orders(
+        self, context: MarketContext, outcome: Optional[bool] = None
+    ) -> None:
         """
-        Cancel all existing orders for a market.
+        Cancel existing orders for a market.
 
         Args:
             context: Market context with current orders
+            outcome: If specified, only cancel orders where `tracked_outcome` matches.
+                     If None, cancel all orders.
         """
+        if outcome is None:
+            orders_to_cancel = list(context.current_orders)
+        else:
+            orders_to_cancel = [
+                o for o in context.current_orders
+                if getattr(o, "tracked_outcome", o.outcome) == outcome
+            ]
+
         if self.read_only:
-            logger.debug(f"[READ-ONLY] Would cancel {len(context.current_orders)} orders")
-            context.current_orders.clear()
+            logger.debug(f"[READ-ONLY] Would cancel {len(orders_to_cancel)} orders")
+            for o in orders_to_cancel:
+                context.current_orders.remove(o)
             return
 
-        for order in context.current_orders:
+        for order in orders_to_cancel:
             if order.side == "ask":
                 # Ask orders exist on both sides (split mint + sell).
                 # Cancel NO-side and YES-side asks.
@@ -403,7 +417,7 @@ class LiquidityProviderBot:
                     else:
                         logger.warning(f"Failed to cancel bid order: {e}")
 
-        context.current_orders.clear()
+            context.current_orders.remove(order)
 
     def place_orders(
         self,
@@ -493,7 +507,7 @@ class LiquidityProviderBot:
             )
             return []
 
-        # Place bid order
+        # Place bid order on the specified outcome
         try:
             tx_hash = self.client.place_buy_order(
                 query_id=context.query_id,
@@ -508,42 +522,47 @@ class LiquidityProviderBot:
                 side="bid",
                 price=-bid_price_int,  # SDK format
                 amount=amount,
+                tracked_outcome=outcome,
             )
             placed_orders.append(bid_order)
             logger.info(
-                f"Placed bid at {bid_price_int} for {amount} shares "
-                f"on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                f"Placed {'YES' if outcome else 'NO'} bid at {bid_price_int} "
+                f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
             )
         except Exception as e:
             logger.error(f"Failed to place bid order: {e}")
 
-        # Place ask orders on BOTH sides of the book.
-        # 1. place_split_limit_order mints pairs and sells NO at (100 - true_price)
-        # 2. place_sell_order sells the retained YES shares as a YES ask
+        # Place ask orders via split mint + sell.
+        # place_split_limit_order(true_price) mints pairs and sells NO at (100 - true_price).
+        # For YES asks: true_price = ask_price (sells NO at 100-ask, keeps YES)
+        # For NO asks: true_price = 100 - ask_price (sells NO at ask_price, keeps YES)
+        # Then place_sell_order sells the retained YES shares.
         try:
+            split_price = ask_price_int if outcome else (100 - ask_price_int)
             self.client.place_split_limit_order(
                 query_id=context.query_id,
-                true_price=ask_price_int,
+                true_price=split_price,
                 amount=amount,
                 wait=True,
             )
             tx_hash = self.client.place_sell_order(
                 query_id=context.query_id,
                 outcome=True,
-                price=ask_price_int,
+                price=split_price,
                 amount=amount,
                 wait=True,
             )
             ask_order = ActiveOrder(
                 query_id=context.query_id,
-                outcome=not outcome,  # Track as NO side (for cancel logic)
+                outcome=False,  # Split order lands on NO side
                 side="ask",
-                price=100 - ask_price_int,  # NO side price
+                price=100 - split_price,  # NO side price where the split order sits
                 amount=amount,
+                tracked_outcome=outcome,
             )
             placed_orders.append(ask_order)
             logger.info(
-                f"Placed ask at {ask_price_int} (YES + NO@{100-ask_price_int}) "
+                f"Placed {'YES' if outcome else 'NO'} ask at {ask_price_int} "
                 f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
             )
         except Exception as e:
@@ -611,7 +630,7 @@ class LiquidityProviderBot:
                 return
 
         try:
-            # Fetch current market state
+            # Fetch current market state for this outcome
             market_state = self.get_market_state(query_id, outcome)
 
             # Calculate target prices
@@ -619,20 +638,26 @@ class LiquidityProviderBot:
                 market_state, context.stream_config
             )
 
+            # Filter orders to this outcome only for update check
+            outcome_orders = [
+                o for o in context.current_orders
+                if getattr(o, "tracked_outcome", o.outcome) == outcome
+            ]
+
             # Check if update is needed
-            if not self.should_update_orders(context.current_orders, pricing):
-                logger.debug(f"No update needed for market {query_id}")
+            if not self.should_update_orders(outcome_orders, pricing):
+                logger.debug(f"No update needed for market {query_id} outcome={outcome}")
                 return
 
-            # Cancel existing orders
-            self.cancel_existing_orders(context)
+            # Cancel existing orders for this outcome only
+            self.cancel_existing_orders(context, outcome=outcome)
 
-            # Place new orders
+            # Place new orders for this outcome
             new_orders = self.place_orders(context, pricing, market_state, outcome)
-            context.current_orders = new_orders
+            context.current_orders.extend(new_orders)
 
             logger.info(
-                f"Updated market {query_id}: "
+                f"Updated market {query_id} {'YES' if outcome else 'NO'}: "
                 f"bid={pricing.bid_price:.2f}, ask={pricing.ask_price:.2f}, "
                 f"mid={pricing.mid_price:.2f}"
             )
@@ -642,8 +667,15 @@ class LiquidityProviderBot:
 
     def update_all_markets(self) -> None:
         """Update orders for all registered markets."""
-        for query_id in self.markets:
-            self.update_market(query_id)
+        for query_id, context in self.markets.items():
+            mode = context.stream_config.outcome_mode
+            outcomes = []
+            if mode in ("yes", "both"):
+                outcomes.append(True)
+            if mode in ("no", "both"):
+                outcomes.append(False)
+            for outcome in outcomes:
+                self.update_market(query_id, outcome=outcome)
 
     def run_once(self) -> None:
         """Run a single update cycle for all markets."""

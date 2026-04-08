@@ -19,12 +19,18 @@ class StreamConfig:
     bounds_pct: float = 0.15  # Bounds as percentage from mid (e.g., 0.10 = ±10%)
     min_order_size: int = 100  # Minimum order size in shares
     enabled: bool = True
+    outcome_mode: str = "yes"  # "yes", "no", or "both"
 
     def __post_init__(self):
         if not 0 < self.bounds_pct < 1:
             raise ValueError(
                 f"Invalid bounds_pct: {self.bounds_pct}. "
                 "Must be between 0 and 1 (e.g., 0.10 for ±10%)"
+            )
+        if self.outcome_mode not in ("yes", "no", "both"):
+            raise ValueError(
+                f"Invalid outcome_mode: {self.outcome_mode}. "
+                "Must be 'yes', 'no', or 'both'"
             )
 
     def calculate_bounds(self, mid_price: float) -> tuple[float, float]:
