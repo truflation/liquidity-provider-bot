@@ -78,6 +78,12 @@ class Config:
     # Pre-settlement cutoff: pull all liquidity this many seconds before settle_time
     pre_settlement_cutoff: float = 900.0  # Default 15 minutes
 
+    # Pricing source for mid-price determination
+    # "black_scholes" = always use B-S fair value from underlying stream data
+    #                    (recommended when there are few market participants)
+    # "order_book" = use order book mid price when available, fallback to mid=50
+    pricing_source: str = "black_scholes"
+
     # Configured streams with rewards-eligible bounds
     streams: list[StreamConfig] = field(default_factory=list)
 
@@ -150,6 +156,8 @@ def load_config_from_env() -> Config:
         alpha=float(os.getenv("LP_BOT_ALPHA", "0.30")),
         default_order_amount=int(os.getenv("LP_BOT_ORDER_AMOUNT", "100")),
     )
+
+    config.pricing_source = os.getenv("LP_BOT_PRICING_SOURCE", "black_scholes")
 
     method = os.getenv("LP_BOT_PRICING_METHOD", "equal").lower()
     if method == "volume":
