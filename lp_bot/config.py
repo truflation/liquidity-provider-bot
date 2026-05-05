@@ -91,6 +91,19 @@ class Config:
         if not 0 <= self.alpha <= 1:
             raise ValueError(f"alpha must be in [0, 1], got {self.alpha}")
 
+        # The pricing_source flag is documented as choosing between
+        # B-S fair value and order-book mid, but no code consumes it
+        # today (only pricing_method is wired through). Reject any
+        # non-default value so users don't believe a setting they
+        # change is taking effect.
+        if self.pricing_source != "black_scholes":
+            raise ValueError(
+                f"pricing_source={self.pricing_source!r} is not implemented "
+                f"yet. Only 'black_scholes' is supported. Tracked as a "
+                f"deferred refactor; remove this check once pricing.py "
+                f"actually branches on the flag."
+            )
+
         # Initialize default streams if empty
         if not self.streams:
             self.streams = get_default_streams()

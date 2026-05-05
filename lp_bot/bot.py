@@ -357,7 +357,8 @@ class LiquidityProviderBot:
         return result
 
     def cancel_existing_orders(
-        self, context: MarketContext, outcome: Optional[bool] = None
+        self, context: MarketContext, outcome: Optional[bool] = None,
+        wait: bool = True,
     ) -> None:
         """
         Cancel existing orders for a market.
@@ -366,6 +367,8 @@ class LiquidityProviderBot:
             context: Market context with current orders
             outcome: If specified, only cancel orders where `tracked_outcome` matches.
                      If None, cancel all orders.
+            wait: If True, block until each cancel confirms on chain. Set to
+                  False on shutdown so a slow RPC can't hang stop() forever.
         """
         if outcome is None:
             orders_to_cancel = list(context.current_orders)
@@ -394,7 +397,7 @@ class LiquidityProviderBot:
                             query_id=order.query_id,
                             outcome=cancel_outcome,
                             price=cancel_price,
-                            wait=True,
+                            wait=wait,
                         )
                     except Exception as e:
                         err_str = str(e).lower()
@@ -408,7 +411,7 @@ class LiquidityProviderBot:
                         query_id=order.query_id,
                         outcome=order.outcome,
                         price=order.price,
-                        wait=True,
+                        wait=wait,
                     )
                 except Exception as e:
                     err_str = str(e).lower()
@@ -708,13 +711,18 @@ class LiquidityProviderBot:
             time.sleep(self.config.check_interval_seconds)
 
     def stop(self) -> None:
-        """Stop the bot and cancel all active orders."""
+        """Stop the bot and cancel all active orders.
+
+        Uses non-blocking cancels (wait=False). Blocking shutdowns are how
+        bot processes get SIGKILLed mid-cleanup by their supervisor; the
+        sister MM bot wedged the orchestrator main thread for 32h on
+        2026-05-01 by blowing past its SIGTERM timeout in this exact path.
+        """
         self.running = False
         logger.info("Stopping LP Bot...")
 
-        # Cancel all active orders
         for context in self.markets.values():
-            self.cancel_existing_orders(context)
+            self.cancel_existing_orders(context, wait=False)
 
         logger.info("LP Bot stopped")
 
