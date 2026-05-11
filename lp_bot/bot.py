@@ -62,11 +62,23 @@ class ActiveOrder:
     """Tracks an active order placed by the bot.
 
     For both bids and asks, `outcome` and `tracked_outcome` are the logical
-    outcome being quoted (YES or NO). For asks the on-chain shape is a
-    two-leg split-mint pair: a sell on `outcome` at `price` plus an
-    auto-listed sell on the opposite outcome at `100 - price`. The local
-    record stores the LOGICAL ask price so should_update_orders compares
-    against the right number on the next cycle.
+    outcome being quoted (YES or NO). The local record stores the LOGICAL
+    price so should_update_orders compares against the right number on the
+    next cycle.
+
+    Two on-chain shapes are possible for an ASK:
+
+    - **Inventory-backed** (`is_inventory_backed=True`): single sell on
+      `outcome` at `price`. No mirror leg on the opposite book.
+    - **Split-mint** (`is_inventory_backed=False`): the pair pattern. A
+      sell on `outcome` at `price` plus an auto-listed sell on the
+      opposite outcome at `100 - price`.
+
+    Cancel and reconcile paths must consult this flag because the two
+    shapes have different on-chain footprints. Cancelling a non-existent
+    mirror leg on the inventory-backed path is harmless RPC waste at best
+    and a same-price collision (bot cancels its own bid at the mirror
+    price) at worst.
     """
     query_id: int
     outcome: bool  # Logical outcome this order quotes (YES or NO)
@@ -74,6 +86,9 @@ class ActiveOrder:
     price: int  # Logical price in cents. Bids stored negative (SDK convention); asks stored positive.
     amount: int
     tracked_outcome: bool = True  # Kept for backwards compat; equals `outcome` for all new orders.
+    # True iff this ASK was placed via inventory-backed `place_sell_order`
+    # (single leg). False for bids and for split-mint ASKs (two legs).
+    is_inventory_backed: bool = False
 
 
 @dataclass
@@ -395,25 +410,39 @@ class LiquidityProviderBot:
             logger.warning(f"Failed to refresh inventory from chain: {e}")
 
     def _reconcile_orders_on_startup(self) -> None:
-        """Match persisted local order state against chain.
+        """Match persisted local order state against chain truth.
 
-        For each registered market we pull both YES and NO order books
-        (since an ASK is a two-leg split-mint pair and a cancel on
-        either side proves the order is gone), build the set of prices
-        with our wallet's orders on chain, and reconcile against the
-        order state file.
+        For each registered market we pull BOTH YES and NO order books,
+        filter to the bot's wallet, and bucket entries by `(outcome,
+        side)` into four maps: `bids[True]`, `bids[False]`, `asks[True]`,
+        `asks[False]`.
 
-        Orders found on chain are kept in local state and re-added to
-        `MarketContext.current_orders` so the main loop can manage
-        them. Orders not found are untracked from local state (filled
-        or externally cancelled while the bot was down).
+        Then per tracked order:
+        - **BID**: active iff `price` is in `bids[outcome]`.
+        - **ASK, inventory-backed**: active iff `price` is in
+          `asks[outcome]` (single on-chain leg, no mirror).
+        - **ASK, split-mint**: active iff `price` is in `asks[outcome]`
+          OR `100 - price` is in `asks[not outcome]` (either leg
+          surviving means the pair is not fully gone).
 
-        Skipped when no order state manager is configured (read-only).
+        Side-and-outcome-aware matching avoids the price-collision
+        bug where a YES BID at 30 falsely matched a YES ASK at 70 (whose
+        split-mint mirror sits at 30).
+
+        Recovered inventory-backed ASKs also re-apply their
+        `MarketInventory.reserve_pair` reservation so the next cycle
+        doesn't double-claim the same shares.
+
+        Skipped in read-only mode (no order state manager) and in
+        sample-data mode (no live SDK to query).
         """
         if self._order_state is None:
             return
+        if self.config.use_sample_data:
+            logger.info("Reconcile skipped: sample-data mode has no chain")
+            return
 
-        wallet_addr = None
+        wallet_addr: Optional[str] = None
         try:
             token = self.config.api_token.strip()
             if token.startswith("0x"):
@@ -421,98 +450,120 @@ class LiquidityProviderBot:
             if len(token) == 64:
                 wallet_addr = _derive_wallet_address(token).lower()
         except Exception:
-            # Best-effort: without a wallet address we'll match all
-            # entries in the order book, which over-counts but at
-            # least doesn't drop our orders. Reconcile is conservative.
             wallet_addr = None
+        if wallet_addr is None:
+            logger.warning(
+                "Reconcile: could not derive wallet address; aborting "
+                "rather than over-matching against other participants' "
+                "orders. Check api_token configuration."
+            )
+            return
 
         for query_id, context in self.markets.items():
-            # Gather BOTH-leg orderbook entries for this market into a
-            # single price->amount map filtered to our wallet.
-            our_prices: dict[int, int] = {}
+            # Bucket entries by (outcome, side). Side is determined by
+            # the SDK's signed-price convention (negative=bid, positive=ask).
+            # We keep these maps separate per (outcome, side) so a BID
+            # at price 30 cannot accidentally match an ASK at 30, and
+            # a YES-side entry cannot match a NO-side tracked order.
+            bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
+            asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
+
             for ob_outcome in (True, False):
                 try:
                     entries = self.client.get_order_book(query_id, ob_outcome)
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
                         f"Reconcile: get_order_book({query_id}, {ob_outcome}) "
-                        f"failed: {e}. Treating outcome as empty."
+                        f"failed: {exc}. Treating outcome as empty."
                     )
                     continue
-                for e in entries:
-                    if wallet_addr is not None:
-                        owner = e.get("wallet_address")
-                        if isinstance(owner, (bytes, bytearray)):
-                            owner_hex = "0x" + owner.hex()
-                        else:
-                            owner_hex = str(owner)
-                        if owner_hex.lower() != wallet_addr:
-                            continue
-                    # Price encoding: negative=bid, positive=ask. Map
-                    # to the LOGICAL price the bot would have tracked.
-                    raw_price = e.get("price")
-                    amount = e.get("amount", 0)
+                for entry in entries:
+                    owner = entry.get("wallet_address")
+                    if owner is None:
+                        continue
+                    if isinstance(owner, (bytes, bytearray)):
+                        owner_hex = "0x" + owner.hex()
+                    else:
+                        owner_hex = str(owner)
+                    if owner_hex.lower() != wallet_addr:
+                        continue
+                    raw_price = entry.get("price")
+                    amount = entry.get("amount", 0)
                     if raw_price is None:
                         continue
                     if raw_price < 0:
-                        # Bid: track absolute price
-                        our_prices[abs(raw_price)] = (
-                            our_prices.get(abs(raw_price), 0) + amount
+                        bids[ob_outcome][abs(raw_price)] = (
+                            bids[ob_outcome].get(abs(raw_price), 0) + amount
                         )
                     elif raw_price > 0:
-                        # Ask leg at price=raw_price. The mirror leg
-                        # would be at 100-raw_price; both correspond to
-                        # logical ASK prices of EITHER raw_price or
-                        # 100-raw_price (depending on which side the
-                        # bot was quoting). Record both so the lookup
-                        # below catches either tracking convention.
-                        our_prices[raw_price] = (
-                            our_prices.get(raw_price, 0) + amount
-                        )
-                        mirror = 100 - raw_price
-                        our_prices[mirror] = (
-                            our_prices.get(mirror, 0) + amount
+                        asks[ob_outcome][raw_price] = (
+                            asks[ob_outcome].get(raw_price, 0) + amount
                         )
 
-            # Now reconcile per-outcome tracked orders against this
-            # merged price map.
+            # Walk tracked orders for this market and decide active vs
+            # stale per side+outcome+is_inventory_backed semantics.
             recovered_bids = 0
             recovered_asks = 0
             stale = 0
-            mode = context.stream_config.outcome_mode
-            outcomes_to_check = []
-            if mode in ("yes", "both"):
-                outcomes_to_check.append(True)
-            if mode in ("no", "both"):
-                outcomes_to_check.append(False)
-            for tracked_outcome in outcomes_to_check:
-                result = self._order_state.reconcile_with_orderbook(
-                    query_id, tracked_outcome, our_prices
-                )
-                for tracked in result["active"]:
-                    # Re-create ActiveOrder so the main loop manages it.
-                    if tracked.is_buy:
-                        order = ActiveOrder(
-                            query_id=query_id,
-                            outcome=tracked.outcome,
-                            side="bid",
-                            price=-tracked.price,
-                            amount=tracked.amount,
-                            tracked_outcome=tracked.outcome,
-                        )
-                        recovered_bids += 1
-                    else:
-                        order = ActiveOrder(
-                            query_id=query_id,
-                            outcome=tracked.outcome,
-                            side="ask",
-                            price=tracked.price,
-                            amount=tracked.amount,
-                            tracked_outcome=tracked.outcome,
-                        )
-                        recovered_asks += 1
-                    context.current_orders.append(order)
-                stale += len(result["stale"])
+            for tracked in self._order_state.get_market_orders(query_id):
+                if tracked.is_buy:
+                    is_active = tracked.price in bids[tracked.outcome]
+                elif tracked.is_inventory_backed:
+                    is_active = tracked.price in asks[tracked.outcome]
+                else:
+                    # Split-mint: either leg surviving means the pair
+                    # is still on chain. We cancelled BOTH legs on
+                    # success last session, so finding just one means
+                    # a partial cancel — caller will retry on the next
+                    # cycle's update.
+                    is_active = (
+                        tracked.price in asks[tracked.outcome]
+                        or (100 - tracked.price) in asks[not tracked.outcome]
+                    )
+
+                if not is_active:
+                    stale += 1
+                    self._order_state.untrack_order(
+                        tracked.query_id,
+                        tracked.outcome,
+                        tracked.is_buy,
+                        tracked.price,
+                    )
+                    continue
+
+                # Recover into MarketContext so the main loop manages it.
+                if tracked.is_buy:
+                    order = ActiveOrder(
+                        query_id=query_id,
+                        outcome=tracked.outcome,
+                        side="bid",
+                        price=-tracked.price,
+                        amount=tracked.amount,
+                        tracked_outcome=tracked.outcome,
+                        is_inventory_backed=False,
+                    )
+                    recovered_bids += 1
+                else:
+                    order = ActiveOrder(
+                        query_id=query_id,
+                        outcome=tracked.outcome,
+                        side="ask",
+                        price=tracked.price,
+                        amount=tracked.amount,
+                        tracked_outcome=tracked.outcome,
+                        is_inventory_backed=tracked.is_inventory_backed,
+                    )
+                    recovered_asks += 1
+                    # Seed the reservation for inventory-backed asks.
+                    # The held count was just refreshed from chain truth
+                    # via `_refresh_inventory()`; without seeding the
+                    # reservation, `available_for_sell` would over-count
+                    # by `tracked.amount` and the next cycle would
+                    # double-list against the same shares.
+                    if tracked.is_inventory_backed:
+                        inv = self._inventory.get_market_inventory(query_id)
+                        inv.reserve_pair(tracked.outcome, tracked.amount)
+                context.current_orders.append(order)
 
             if recovered_bids or recovered_asks or stale:
                 logger.info(
@@ -625,11 +676,30 @@ class LiquidityProviderBot:
             # not found" is treated as success because chain has already lost
             # it (settled, externally cancelled, etc.).
             cancel_succeeded = True
-            if order.side == "ask":
-                # Ask orders exist on both sides (split mint + sell).
-                # We track the LOGICAL ask (outcome, ask_price_int); the
-                # on-chain pair is at (outcome, ask_price) AND
-                # (not outcome, 100 - ask_price). Cancel both legs.
+            if order.side == "ask" and order.is_inventory_backed:
+                # Inventory-backed ASK is a single sell on `outcome` at
+                # `price`. There is NO mirror leg on the opposite book —
+                # cancelling at (not outcome, 100-price) would either hit
+                # nothing (harmless waste) or accidentally cancel an
+                # unrelated bot order at that exact price (a same-price
+                # collision risk that's plausible on tight-bound markets).
+                try:
+                    self.client.cancel_order(
+                        query_id=order.query_id,
+                        outcome=order.outcome,
+                        price=order.price,
+                        wait=wait,
+                    )
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "order not found" in err_str or "old order not found" in err_str:
+                        logger.debug(f"Order already gone for market {order.query_id}")
+                    else:
+                        logger.warning(f"Failed to cancel inventory-backed ask: {e}")
+                        cancel_succeeded = False
+            elif order.side == "ask":
+                # Split-mint ASK: the on-chain pair is at (outcome, price)
+                # AND (not outcome, 100 - price). Cancel both legs.
                 for cancel_outcome, cancel_price in [
                     (order.outcome, order.price),
                     (not order.outcome, 100 - order.price),
@@ -646,9 +716,10 @@ class LiquidityProviderBot:
                         if "order not found" in err_str or "old order not found" in err_str:
                             logger.debug(f"Order already gone for market {order.query_id}")
                         else:
-                            logger.warning(f"Failed to cancel ask leg: {e}")
+                            logger.warning(f"Failed to cancel split-mint ask leg: {e}")
                             cancel_succeeded = False
             else:
+                # Bid: single cancel at (outcome, price).
                 try:
                     self.client.cancel_order(
                         query_id=order.query_id,
@@ -674,19 +745,21 @@ class LiquidityProviderBot:
                         is_buy=(order.side == "bid"),
                         price=abs(order.price),
                     )
-                if order.side == "ask":
+                if order.side == "ask" and order.is_inventory_backed:
                     # An inventory-backed ASK reserved `amount` shares
                     # against held inventory; release them back to
-                    # available now that the cancel landed. Split-mint
-                    # ASKs reserved nothing (release is a no-op clamped
-                    # at zero), so this is safe to call unconditionally.
+                    # available now that the cancel landed. Skip the
+                    # release for split-mint ASKs (they reserved
+                    # nothing) so a stray double-release on shutdown
+                    # can't corrupt accounting.
                     inv = self._inventory.get_market_inventory(order.query_id)
                     inv.release_pair(order.outcome, order.amount)
             else:
                 logger.warning(
                     f"Keeping order in local state after cancel failure: "
                     f"market={order.query_id} side={order.side} "
-                    f"outcome={order.outcome} price={order.price}"
+                    f"outcome={order.outcome} price={order.price} "
+                    f"inv_backed={order.is_inventory_backed}"
                 )
 
     def place_orders(
@@ -853,6 +926,7 @@ class LiquidityProviderBot:
                     price=ask_price_int,
                     amount=amount,
                     tracked_outcome=outcome,
+                    is_inventory_backed=True,
                 )
                 placed_orders.append(ask_order)
                 if self._order_state is not None:
