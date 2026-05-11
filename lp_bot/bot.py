@@ -558,6 +558,11 @@ class LiquidityProviderBot:
                     continue
 
                 # Recover into MarketContext so the main loop manages it.
+                # `created_at` carries over from the persisted state so
+                # `max_order_age` continues to count from the original
+                # placement, not the recovery moment — an order that
+                # was already stale at restart age-refreshes on the
+                # first post-recovery cycle.
                 if tracked.is_buy:
                     order = ActiveOrder(
                         query_id=query_id,
@@ -567,6 +572,7 @@ class LiquidityProviderBot:
                         amount=tracked.amount,
                         tracked_outcome=tracked.outcome,
                         is_inventory_backed=False,
+                        created_at=tracked.created_at,
                     )
                     recovered_bids += 1
                 else:
@@ -578,6 +584,7 @@ class LiquidityProviderBot:
                         amount=tracked.amount,
                         tracked_outcome=tracked.outcome,
                         is_inventory_backed=tracked.is_inventory_backed,
+                        created_at=tracked.created_at,
                     )
                     recovered_asks += 1
                     # Seed the reservation for inventory-backed asks.
@@ -1205,7 +1212,14 @@ class LiquidityProviderBot:
                 return True
             if order.side == "ask" and abs(current_price - new_ask) >= threshold:
                 return True
-            if max_age is not None and order.created_at > 0:
+            if max_age is not None:
+                # `created_at=0` from a manually-constructed ActiveOrder
+                # is treated as "very old" so the next cycle forces a
+                # refresh — preferable to skipping the age check and
+                # leaving a hand-built order to drift forever. Real
+                # placements always set `created_at=time.time()` and
+                # recovery threads through the persisted timestamp, so
+                # this branch is the defensive case only.
                 age = now - order.created_at
                 if age >= max_age:
                     logger.info(
@@ -1369,6 +1383,18 @@ class LiquidityProviderBot:
             # opt-in: short-circuits when no markets configure
             # `initial_mint_pairs` or the wallet cap is unset.
             self._pre_mint_all_markets()
+            # Refresh inventory again so the freshly-minted pairs show
+            # up in `available_for_sell` for the first cycle's ASKs.
+            # Without this, the next 1-5 cycles would see a stale cache
+            # (refresh runs every `inventory_refresh_interval_cycles`,
+            # default 6), report `available_for_sell=0` on every market
+            # that was just pre-minted, and redundantly take the split-
+            # mint fallback — wasting gas and double-minting against
+            # pairs we just paid for. Also resets the cycle counter so
+            # the next periodic refresh happens at the configured cadence
+            # from this point.
+            self._refresh_inventory()
+            self._cycles_since_inventory_refresh = 0
 
         while self.running:
             try:
