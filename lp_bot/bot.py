@@ -755,6 +755,17 @@ class LiquidityProviderBot:
             # Cancel existing orders for this outcome only
             self.cancel_existing_orders(context, outcome=outcome)
 
+            # Re-check shutdown after cancel. cancel_existing_orders runs
+            # several blocking `wait=True` RPCs; a SIGTERM that arrives
+            # during cancel should NOT lead to placing fresh orders that
+            # the supervisor is about to SIGKILL anyway.
+            if not self.running:
+                logger.info(
+                    f"Shutdown requested during cancel; skipping place "
+                    f"for market {query_id} outcome={outcome}"
+                )
+                return
+
             # Place new orders for this outcome
             new_orders = self.place_orders(context, pricing, market_state, outcome)
             context.current_orders.extend(new_orders)
@@ -773,13 +784,15 @@ class LiquidityProviderBot:
 
         Honors a cooperative shutdown request: between each market we
         check `self.running` so a SIGTERM received mid-cycle exits within
-        seconds rather than running the full pass to completion.
+        one in-progress market's RPC duration (worst case ~10-30s on a
+        slow gateway with several `wait=True` calls per market) rather
+        than running the full pass to completion.
         """
         for query_id, context in self.markets.items():
             if not self.running:
                 logger.info(
-                    f"Shutdown requested mid-cycle; aborting after "
-                    f"{query_id} market boundary"
+                    f"Shutdown requested mid-cycle; aborting before "
+                    f"market {query_id}"
                 )
                 return
             mode = context.stream_config.outcome_mode
