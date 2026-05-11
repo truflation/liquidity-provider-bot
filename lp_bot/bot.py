@@ -57,6 +57,26 @@ def _derive_wallet_address(private_key: str) -> str:
     return Account.from_key(key).address
 
 
+def _compute_base_amount(
+    price_cents: int,
+    order_dollar_amount: Optional[float],
+    default_amount: int,
+) -> int:
+    """Per-leg share count.
+
+    With `order_dollar_amount` set, returns `ceil(dollars * 100 / price)`
+    so a $2 BID at 1c is 200 shares and a $2 BID at 99c is ~3 shares —
+    both around $2 notional. Without it, returns `default_amount` (the
+    pre-Phase-2b behavior). Clamped to >=1.
+    """
+    if order_dollar_amount is None or order_dollar_amount <= 0:
+        return max(1, default_amount)
+    if price_cents <= 0:
+        return max(1, default_amount)
+    import math
+    return max(1, math.ceil(order_dollar_amount * 100.0 / price_cents))
+
+
 @dataclass
 class ActiveOrder:
     """Tracks an active order placed by the bot.
@@ -89,6 +109,12 @@ class ActiveOrder:
     # True iff this ASK was placed via inventory-backed `place_sell_order`
     # (single leg). False for bids and for split-mint ASKs (two legs).
     is_inventory_backed: bool = False
+    # Unix timestamp at placement. Drives `max_order_age` forced refresh.
+    # Defaults to 0.0 (treated as "very old", forces a refresh) so any
+    # ActiveOrder constructed without an explicit timestamp — including
+    # those recovered on startup before chain truth confirms — gets
+    # rotated through the place pipeline on the next cycle.
+    created_at: float = 0.0
 
 
 @dataclass
@@ -572,6 +598,131 @@ class LiquidityProviderBot:
                     f"{stale} stale dropped"
                 )
 
+    def _pre_mint_all_markets(self) -> None:
+        """One-time split-mint pass to bring each market up to its
+        configured `initial_mint_pairs` target.
+
+        Pre-mint is **opt-in**. It does nothing unless ALL of:
+          - `config.pre_mint_max_total_collateral_usd` is set (the
+            wallet circuit breaker); AND
+          - at least one registered market has `initial_mint_pairs`
+            on its `StreamConfig`; AND
+          - the bot is not in read-only / sample-data mode.
+
+        For each opt-in market the deficit is `target - paired_inventory()`,
+        clamped at zero. Markets within `pre_settlement_cutoff +
+        pre_mint_settlement_buffer` of settling are skipped so collateral
+        isn't burned on a market that's about to be liquidated.
+
+        The SDK's `place_split_limit_order(true_price=X)` mints `amount`
+        YES+NO pairs and auto-lists the NO leg at `100 - X`. Setting
+        `pre_mint_listing_price_yes_cents=1` (the default) parks the
+        auto-listed NO at 99c. The bot then cancels the auto-listed
+        leg in the next refresh cycle, leaving both YES and NO as
+        held inventory; `available_for_sell` reports them and the
+        inventory-aware ASK path can back asks against them without
+        a fresh mint.
+
+        Honors SIGTERM (`self.running`) between markets so a shutdown
+        request during a long pre-mint pass exits cleanly.
+        """
+        cap = self.config.pre_mint_max_total_collateral_usd
+        if cap is None:
+            logger.info(
+                "Pre-mint disabled: pre_mint_max_total_collateral_usd "
+                "is not set. Leave it unset to keep lazy-mint behavior."
+            )
+            return
+        if self.read_only or self.config.use_sample_data:
+            logger.info(
+                "Pre-mint skipped: %s",
+                "read-only mode" if self.read_only else "sample-data mode",
+            )
+            return
+
+        cutoff_buffer = (
+            self.config.pre_settlement_cutoff
+            + self.config.pre_mint_settlement_buffer
+        )
+        now_ts = int(time.time())
+
+        deficits: dict[int, int] = {}
+        total_deficit_pairs = 0
+        for query_id, context in self.markets.items():
+            target = context.stream_config.initial_mint_pairs
+            if not target or target <= 0:
+                continue
+            settle_time = context.settle_time
+            if settle_time is not None and (settle_time - now_ts) <= cutoff_buffer:
+                logger.info(
+                    f"Pre-mint skip market {query_id}: settle_time={settle_time} "
+                    f"within {cutoff_buffer}s of cutoff"
+                )
+                continue
+            inv = self._inventory.get_market_inventory(query_id)
+            paired = inv.paired_inventory()
+            deficit = max(0, int(target) - int(paired))
+            if deficit > 0:
+                deficits[query_id] = deficit
+                total_deficit_pairs += deficit
+
+        if not deficits:
+            logger.info(
+                f"Pre-mint: no deficit across {len(self.markets)} markets"
+            )
+            return
+
+        if total_deficit_pairs > cap:
+            logger.error(
+                f"Pre-mint aborted: total deficit {total_deficit_pairs} "
+                f"pairs (${total_deficit_pairs}) exceeds "
+                f"pre_mint_max_total_collateral_usd={cap:.2f}. Lower the "
+                f"per-market initial_mint_pairs or raise the cap if "
+                f"intentional."
+            )
+            raise RuntimeError("pre_mint_max_total_collateral_usd exceeded")
+
+        park_price = int(self.config.pre_mint_listing_price_yes_cents)
+        logger.info(
+            f"Pre-mint pre-flight: gateway={self.config.node_url}, "
+            f"deficit={total_deficit_pairs} pairs (${total_deficit_pairs} "
+            f"collateral) across {len(deficits)} markets, park "
+            f"true_price={park_price} (auto-lists NO at {100 - park_price}c)"
+        )
+
+        broadcast_count = 0
+        for query_id, deficit in deficits.items():
+            if not self.running:
+                logger.info(
+                    f"Pre-mint interrupted by shutdown request after "
+                    f"broadcasting {broadcast_count}/{len(deficits)} markets"
+                )
+                return
+            try:
+                self.client.place_split_limit_order(
+                    query_id=query_id,
+                    true_price=park_price,
+                    amount=deficit,
+                    wait=True,
+                )
+                broadcast_count += 1
+                logger.info(
+                    f"Pre-mint market {query_id}: minted {deficit} pairs "
+                    f"(NO auto-listed at {100 - park_price}c)"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Pre-mint failed for market {query_id} "
+                    f"(deficit={deficit} pairs): {e}. Bot will fall back "
+                    f"to per-cycle split-mint for this market."
+                )
+
+        logger.info(
+            f"Pre-mint complete: {broadcast_count}/{len(deficits)} markets minted, "
+            f"~${total_deficit_pairs} collateral committed. Inventory will be "
+            f"refreshed on the next cycle's `_refresh_inventory` tick."
+        )
+
     def calculate_target_prices(
         self,
         market_state: MarketState,
@@ -783,7 +934,6 @@ class LiquidityProviderBot:
         """
         placed_orders = []
         stream_config = context.stream_config
-        amount = max(self.config.default_order_amount, stream_config.min_order_size)
 
         # Get bounds from pricing result (already calculated dynamically)
         lower_bound = int(pricing.lower_bound)
@@ -802,6 +952,24 @@ class LiquidityProviderBot:
             bid_price_int = mid - 1
             ask_price_int = mid + 1
 
+        # Per-leg sizing. When `order_dollar_amount` is set, the BID at
+        # 1c and the ASK at 99c can be wildly different in shares but
+        # comparable in dollars; otherwise fall back to fixed shares.
+        bid_amount = max(
+            _compute_base_amount(
+                bid_price_int, self.config.order_dollar_amount,
+                self.config.default_order_amount,
+            ),
+            stream_config.min_order_size,
+        )
+        ask_amount = max(
+            _compute_base_amount(
+                ask_price_int, self.config.order_dollar_amount,
+                self.config.default_order_amount,
+            ),
+            stream_config.min_order_size,
+        )
+
         # Build recommendations
         recommendations = [
             OrderRecommendation(
@@ -810,7 +978,7 @@ class LiquidityProviderBot:
                 outcome=outcome,
                 side="bid",
                 price=bid_price_int,
-                amount=amount,
+                amount=bid_amount,
             ),
             OrderRecommendation(
                 query_id=context.query_id,
@@ -818,7 +986,7 @@ class LiquidityProviderBot:
                 outcome=outcome,
                 side="ask",
                 price=ask_price_int,
-                amount=amount,
+                amount=ask_amount,
             ),
         ]
 
@@ -846,15 +1014,15 @@ class LiquidityProviderBot:
         if self.read_only:
             logger.info(
                 f"[READ-ONLY] Market {context.query_id} ({stream_config.name}): "
-                f"BID {bid_price_int} / ASK {ask_price_int} x{amount}"
+                f"BID {bid_price_int}c x{bid_amount} / ASK {ask_price_int}c x{ask_amount}"
             )
             return []
 
         # Place bid order on the specified outcome
-        if not _meets_min_notional(bid_price_int, amount):
+        if not _meets_min_notional(bid_price_int, bid_amount):
             logger.info(
                 f"Market {context.query_id}: skip {'YES' if outcome else 'NO'} bid "
-                f"@{bid_price_int}c x{amount} (notional {bid_price_int * amount} < "
+                f"@{bid_price_int}c x{bid_amount} (notional {bid_price_int * bid_amount} < "
                 f"min {MIN_ORDER_NOTIONAL_CENT_SHARES}). Order would silently revert."
             )
         else:
@@ -863,7 +1031,7 @@ class LiquidityProviderBot:
                     query_id=context.query_id,
                     outcome=outcome,
                     price=bid_price_int,
-                    amount=amount,
+                    amount=bid_amount,
                     wait=True,
                 )
                 bid_order = ActiveOrder(
@@ -871,8 +1039,9 @@ class LiquidityProviderBot:
                     outcome=outcome,
                     side="bid",
                     price=-bid_price_int,  # SDK format
-                    amount=amount,
+                    amount=bid_amount,
                     tracked_outcome=outcome,
+                    created_at=time.time(),
                 )
                 placed_orders.append(bid_order)
                 if self._order_state is not None:
@@ -881,12 +1050,12 @@ class LiquidityProviderBot:
                         outcome=outcome,
                         is_buy=True,
                         price=bid_price_int,
-                        amount=amount,
+                        amount=bid_amount,
                         is_inventory_backed=False,
                     )
                 logger.info(
                     f"Placed {'YES' if outcome else 'NO'} bid at {bid_price_int} "
-                    f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                    f"for {bid_amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
                 )
             except Exception as e:
                 logger.error(f"Failed to place bid order: {e}")
@@ -900,7 +1069,7 @@ class LiquidityProviderBot:
         inv = self._inventory.get_market_inventory(context.query_id)
         available = inv.available_for_sell(outcome)
 
-        if available >= amount and _meets_min_notional(ask_price_int, amount):
+        if available >= ask_amount and _meets_min_notional(ask_price_int, ask_amount):
             # Inventory-backed path. Single-leg sell on the logical outcome
             # at the logical price. No fresh pair mint, no NO-side leg.
             try:
@@ -908,25 +1077,26 @@ class LiquidityProviderBot:
                     query_id=context.query_id,
                     outcome=outcome,
                     price=ask_price_int,
-                    amount=amount,
+                    amount=ask_amount,
                     wait=True,
                 )
             except Exception as e:
                 logger.error(
                     f"Inventory-backed sell failed (qid={context.query_id} "
                     f"outcome={'YES' if outcome else 'NO'} {ask_price_int}c "
-                    f"x{amount}): {e}"
+                    f"x{ask_amount}): {e}"
                 )
             else:
-                inv.reserve_pair(outcome, amount)
+                inv.reserve_pair(outcome, ask_amount)
                 ask_order = ActiveOrder(
                     query_id=context.query_id,
                     outcome=outcome,
                     side="ask",
                     price=ask_price_int,
-                    amount=amount,
+                    amount=ask_amount,
                     tracked_outcome=outcome,
                     is_inventory_backed=True,
+                    created_at=time.time(),
                 )
                 placed_orders.append(ask_order)
                 if self._order_state is not None:
@@ -935,13 +1105,13 @@ class LiquidityProviderBot:
                         outcome=outcome,
                         is_buy=False,
                         price=ask_price_int,
-                        amount=amount,
+                        amount=ask_amount,
                         is_inventory_backed=True,
                     )
                 logger.info(
                     f"Inventory-backed {'YES' if outcome else 'NO'} ask "
-                    f"@{ask_price_int}c x{amount} on market {context.query_id} "
-                    f"(avail before/after: {available}/{available - amount}, "
+                    f"@{ask_price_int}c x{ask_amount} on market {context.query_id} "
+                    f"(avail before/after: {available}/{available - ask_amount}, "
                     f"tx: {tx_hash[:16]}...)"
                 )
         else:
@@ -949,13 +1119,13 @@ class LiquidityProviderBot:
             # lists both legs. Same shape as the pre-Phase-2 bot.
             split_price = ask_price_int if outcome else (100 - ask_price_int)
             ask_legs_ok = (
-                _meets_min_notional(split_price, amount)
-                and _meets_min_notional(100 - split_price, amount)
+                _meets_min_notional(split_price, ask_amount)
+                and _meets_min_notional(100 - split_price, ask_amount)
             )
             if not ask_legs_ok:
                 logger.info(
                     f"Market {context.query_id}: skip {'YES' if outcome else 'NO'} ask "
-                    f"@{ask_price_int}c x{amount} (split_price={split_price}, one leg "
+                    f"@{ask_price_int}c x{ask_amount} (split_price={split_price}, one leg "
                     f"falls below min notional {MIN_ORDER_NOTIONAL_CENT_SHARES}). "
                     f"Order would silently revert."
                 )
@@ -964,14 +1134,14 @@ class LiquidityProviderBot:
                     self.client.place_split_limit_order(
                         query_id=context.query_id,
                         true_price=split_price,
-                        amount=amount,
+                        amount=ask_amount,
                         wait=True,
                     )
                     tx_hash = self.client.place_sell_order(
                         query_id=context.query_id,
                         outcome=True,
                         price=split_price,
-                        amount=amount,
+                        amount=ask_amount,
                         wait=True,
                     )
                     ask_order = ActiveOrder(
@@ -979,8 +1149,9 @@ class LiquidityProviderBot:
                         outcome=outcome,
                         side="ask",
                         price=ask_price_int,  # logical ASK price
-                        amount=amount,
+                        amount=ask_amount,
                         tracked_outcome=outcome,
+                        created_at=time.time(),
                     )
                     placed_orders.append(ask_order)
                     if self._order_state is not None:
@@ -989,12 +1160,12 @@ class LiquidityProviderBot:
                             outcome=outcome,
                             is_buy=False,
                             price=ask_price_int,
-                            amount=amount,
+                            amount=ask_amount,
                             is_inventory_backed=False,
                         )
                     logger.info(
                         f"Placed {'YES' if outcome else 'NO'} ask at {ask_price_int} "
-                        f"for {amount} shares on market {context.query_id} "
+                        f"for {ask_amount} shares on market {context.query_id} "
                         f"(split-mint, tx: {tx_hash[:16]}...)"
                     )
                 except Exception as e:
@@ -1009,20 +1180,24 @@ class LiquidityProviderBot:
         threshold: float = 1.0,
     ) -> bool:
         """
-        Determine if orders should be updated based on price change.
+        Determine if orders should be updated based on price change OR age.
 
-        Args:
-            current_orders: Currently active orders
-            new_pricing: Newly calculated prices
-            threshold: Minimum price change to trigger update
+        Returns True iff at least one tracked order has either:
+          - moved enough that the new bid/ask differs from the recorded
+            price by >= `threshold` cents, OR
+          - aged past `config.max_order_age` seconds (when set).
 
-        Returns:
-            True if orders should be updated
+        The age branch catches stuck-quiet regressions where prices
+        stop refreshing and orders stay glued to a stale book. Without
+        it, a bot that stops getting fills and observes no price moves
+        would never refresh.
         """
         if not current_orders:
             return True
 
         new_bid, new_ask = new_pricing.to_int_prices()
+        max_age = self.config.max_order_age
+        now = time.time() if max_age is not None else 0.0
 
         for order in current_orders:
             current_price = abs(order.price)
@@ -1030,6 +1205,16 @@ class LiquidityProviderBot:
                 return True
             if order.side == "ask" and abs(current_price - new_ask) >= threshold:
                 return True
+            if max_age is not None and order.created_at > 0:
+                age = now - order.created_at
+                if age >= max_age:
+                    logger.info(
+                        f"Forcing refresh: {order.side} on market "
+                        f"{order.query_id} outcome={order.outcome} "
+                        f"price={current_price} aged {age:.0f}s "
+                        f"(>= max_order_age={max_age:.0f}s)"
+                    )
+                    return True
 
         return False
 
@@ -1179,6 +1364,11 @@ class LiquidityProviderBot:
         if not self.read_only:
             self._refresh_inventory()
             self._reconcile_orders_on_startup()
+            # Pre-mint after reconcile so deficits are computed against
+            # recovered held + listed inventory, not zero. Pre-mint is
+            # opt-in: short-circuits when no markets configure
+            # `initial_mint_pairs` or the wallet cap is unset.
+            self._pre_mint_all_markets()
 
         while self.running:
             try:
