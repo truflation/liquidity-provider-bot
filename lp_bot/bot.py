@@ -24,6 +24,8 @@ from .order_book import (
     build_market_state,
     levels_to_positive_prices,
 )
+from .inventory import InventoryManager
+from .order_state import OrderStateManager
 
 
 logger = logging.getLogger(__name__)
@@ -190,6 +192,24 @@ class LiquidityProviderBot:
         # Store latest snapshots for JSON output
         self._snapshots: list[MarketSnapshot] = []
 
+        # Per-market inventory accounting. Lets the bot back ASKs with
+        # held shares (single-leg place_sell_order) instead of fresh
+        # split-mints every cycle. Updated from chain via
+        # `_refresh_inventory` which calls `get_user_positions`.
+        self._inventory = InventoryManager()
+
+        # Persistent order state for restart recovery. In read-only mode
+        # we skip the file entirely so dry runs don't litter the cwd.
+        if read_only:
+            self._order_state: Optional[OrderStateManager] = None
+        else:
+            self._order_state = OrderStateManager(config.order_state_file)
+
+        # Cycles since the last inventory refresh. Refreshes are
+        # heavyweight (`get_user_positions` over many markets), so we
+        # gate to every N cycles rather than every cycle.
+        self._cycles_since_inventory_refresh = 0
+
     @property
     def client(self) -> "TNClient":
         """Lazily initialize the TNClient when first accessed."""
@@ -343,6 +363,164 @@ class LiquidityProviderBot:
                 ask_levels=[],
             )
 
+    def _refresh_inventory(self) -> None:
+        """Pull `get_user_positions` and rebuild per-market inventory.
+
+        Held + listed counts are overwritten from chain truth. Bot-side
+        reservations are left alone — they represent in-flight intent
+        that hasn't yet landed on chain.
+
+        Skipped in read-only mode and when the bot has no client
+        (sample-data mode).
+        """
+        if self.read_only or self.config.use_sample_data:
+            return
+        try:
+            positions = self.client.get_user_positions()
+            # SDK returns a list of dicts in v0.7.x. Accept both dict
+            # and object styles to stay defensive across versions.
+            normalized = []
+            for p in positions:
+                if isinstance(p, dict):
+                    normalized.append(p)
+                else:
+                    normalized.append({
+                        "query_id": getattr(p, "query_id", None),
+                        "outcome": getattr(p, "outcome", True),
+                        "price": getattr(p, "price", 0),
+                        "amount": getattr(p, "amount", 0),
+                    })
+            self._inventory.update_from_user_positions(normalized)
+        except Exception as e:
+            logger.warning(f"Failed to refresh inventory from chain: {e}")
+
+    def _reconcile_orders_on_startup(self) -> None:
+        """Match persisted local order state against chain.
+
+        For each registered market we pull both YES and NO order books
+        (since an ASK is a two-leg split-mint pair and a cancel on
+        either side proves the order is gone), build the set of prices
+        with our wallet's orders on chain, and reconcile against the
+        order state file.
+
+        Orders found on chain are kept in local state and re-added to
+        `MarketContext.current_orders` so the main loop can manage
+        them. Orders not found are untracked from local state (filled
+        or externally cancelled while the bot was down).
+
+        Skipped when no order state manager is configured (read-only).
+        """
+        if self._order_state is None:
+            return
+
+        wallet_addr = None
+        try:
+            token = self.config.api_token.strip()
+            if token.startswith("0x"):
+                token = token[2:]
+            if len(token) == 64:
+                wallet_addr = _derive_wallet_address(token).lower()
+        except Exception:
+            # Best-effort: without a wallet address we'll match all
+            # entries in the order book, which over-counts but at
+            # least doesn't drop our orders. Reconcile is conservative.
+            wallet_addr = None
+
+        for query_id, context in self.markets.items():
+            # Gather BOTH-leg orderbook entries for this market into a
+            # single price->amount map filtered to our wallet.
+            our_prices: dict[int, int] = {}
+            for ob_outcome in (True, False):
+                try:
+                    entries = self.client.get_order_book(query_id, ob_outcome)
+                except Exception as e:
+                    logger.warning(
+                        f"Reconcile: get_order_book({query_id}, {ob_outcome}) "
+                        f"failed: {e}. Treating outcome as empty."
+                    )
+                    continue
+                for e in entries:
+                    if wallet_addr is not None:
+                        owner = e.get("wallet_address")
+                        if isinstance(owner, (bytes, bytearray)):
+                            owner_hex = "0x" + owner.hex()
+                        else:
+                            owner_hex = str(owner)
+                        if owner_hex.lower() != wallet_addr:
+                            continue
+                    # Price encoding: negative=bid, positive=ask. Map
+                    # to the LOGICAL price the bot would have tracked.
+                    raw_price = e.get("price")
+                    amount = e.get("amount", 0)
+                    if raw_price is None:
+                        continue
+                    if raw_price < 0:
+                        # Bid: track absolute price
+                        our_prices[abs(raw_price)] = (
+                            our_prices.get(abs(raw_price), 0) + amount
+                        )
+                    elif raw_price > 0:
+                        # Ask leg at price=raw_price. The mirror leg
+                        # would be at 100-raw_price; both correspond to
+                        # logical ASK prices of EITHER raw_price or
+                        # 100-raw_price (depending on which side the
+                        # bot was quoting). Record both so the lookup
+                        # below catches either tracking convention.
+                        our_prices[raw_price] = (
+                            our_prices.get(raw_price, 0) + amount
+                        )
+                        mirror = 100 - raw_price
+                        our_prices[mirror] = (
+                            our_prices.get(mirror, 0) + amount
+                        )
+
+            # Now reconcile per-outcome tracked orders against this
+            # merged price map.
+            recovered_bids = 0
+            recovered_asks = 0
+            stale = 0
+            mode = context.stream_config.outcome_mode
+            outcomes_to_check = []
+            if mode in ("yes", "both"):
+                outcomes_to_check.append(True)
+            if mode in ("no", "both"):
+                outcomes_to_check.append(False)
+            for tracked_outcome in outcomes_to_check:
+                result = self._order_state.reconcile_with_orderbook(
+                    query_id, tracked_outcome, our_prices
+                )
+                for tracked in result["active"]:
+                    # Re-create ActiveOrder so the main loop manages it.
+                    if tracked.is_buy:
+                        order = ActiveOrder(
+                            query_id=query_id,
+                            outcome=tracked.outcome,
+                            side="bid",
+                            price=-tracked.price,
+                            amount=tracked.amount,
+                            tracked_outcome=tracked.outcome,
+                        )
+                        recovered_bids += 1
+                    else:
+                        order = ActiveOrder(
+                            query_id=query_id,
+                            outcome=tracked.outcome,
+                            side="ask",
+                            price=tracked.price,
+                            amount=tracked.amount,
+                            tracked_outcome=tracked.outcome,
+                        )
+                        recovered_asks += 1
+                    context.current_orders.append(order)
+                stale += len(result["stale"])
+
+            if recovered_bids or recovered_asks or stale:
+                logger.info(
+                    f"Reconcile market {query_id}: "
+                    f"{recovered_bids} bids + {recovered_asks} asks recovered, "
+                    f"{stale} stale dropped"
+                )
+
     def calculate_target_prices(
         self,
         market_state: MarketState,
@@ -488,6 +666,22 @@ class LiquidityProviderBot:
 
             if cancel_succeeded:
                 context.current_orders.remove(order)
+                # Mirror in persistent state and inventory accounting.
+                if self._order_state is not None:
+                    self._order_state.untrack_order(
+                        query_id=order.query_id,
+                        outcome=order.outcome,
+                        is_buy=(order.side == "bid"),
+                        price=abs(order.price),
+                    )
+                if order.side == "ask":
+                    # An inventory-backed ASK reserved `amount` shares
+                    # against held inventory; release them back to
+                    # available now that the cancel landed. Split-mint
+                    # ASKs reserved nothing (release is a no-op clamped
+                    # at zero), so this is safe to call unconditionally.
+                    inv = self._inventory.get_market_inventory(order.query_id)
+                    inv.release_pair(order.outcome, order.amount)
             else:
                 logger.warning(
                     f"Keeping order in local state after cancel failure: "
@@ -608,6 +802,15 @@ class LiquidityProviderBot:
                     tracked_outcome=outcome,
                 )
                 placed_orders.append(bid_order)
+                if self._order_state is not None:
+                    self._order_state.track_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        is_buy=True,
+                        price=bid_price_int,
+                        amount=amount,
+                        is_inventory_backed=False,
+                    )
                 logger.info(
                     f"Placed {'YES' if outcome else 'NO'} bid at {bid_price_int} "
                     f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
@@ -615,61 +818,113 @@ class LiquidityProviderBot:
             except Exception as e:
                 logger.error(f"Failed to place bid order: {e}")
 
-        # Place ask orders via split mint + sell.
-        # place_split_limit_order(true_price) mints pairs and auto-lists the
-        # NO side at (100 - true_price). The bot then sells the retained YES
-        # shares via place_sell_order(outcome=True, price=true_price). For YES
-        # asks: split_price = ask_price (YES sell lands at ask_price). For NO
-        # asks: split_price = 100 - ask_price (auto-listed NO leg lands at
-        # ask_price). Both legs end up on-chain in either case; the bot tracks
-        # the LOGICAL ask (outcome, ask_price_int) so should_update_orders
-        # compares against the right price next cycle (previously the bot
-        # tracked the auto-listed NO leg's price, which made should_update
-        # trip every cycle on YES asks and silently re-mint fresh pairs).
-        split_price = ask_price_int if outcome else (100 - ask_price_int)
-        # Both legs must clear min-notional: the manual sell at split_price
-        # (which we'll log) and the auto-listed leg at 100 - split_price.
-        ask_legs_ok = (
-            _meets_min_notional(split_price, amount)
-            and _meets_min_notional(100 - split_price, amount)
-        )
-        if not ask_legs_ok:
-            logger.info(
-                f"Market {context.query_id}: skip {'YES' if outcome else 'NO'} ask "
-                f"@{ask_price_int}c x{amount} (split_price={split_price}, one leg "
-                f"falls below min notional {MIN_ORDER_NOTIONAL_CENT_SHARES}). "
-                f"Order would silently revert."
-            )
-        else:
+        # Place ask. Prefer inventory-backed (single-leg `place_sell_order`
+        # against held shares) when enough inventory is available; fall
+        # back to the legacy split-mint pattern when not. Both paths track
+        # the LOGICAL ask `(outcome, ask_price_int)` so should_update_orders
+        # compares against the right price next cycle and the cancel path
+        # iterates both legs correctly.
+        inv = self._inventory.get_market_inventory(context.query_id)
+        available = inv.available_for_sell(outcome)
+
+        if available >= amount and _meets_min_notional(ask_price_int, amount):
+            # Inventory-backed path. Single-leg sell on the logical outcome
+            # at the logical price. No fresh pair mint, no NO-side leg.
             try:
-                self.client.place_split_limit_order(
-                    query_id=context.query_id,
-                    true_price=split_price,
-                    amount=amount,
-                    wait=True,
-                )
                 tx_hash = self.client.place_sell_order(
                     query_id=context.query_id,
-                    outcome=True,
-                    price=split_price,
+                    outcome=outcome,
+                    price=ask_price_int,
                     amount=amount,
                     wait=True,
                 )
+            except Exception as e:
+                logger.error(
+                    f"Inventory-backed sell failed (qid={context.query_id} "
+                    f"outcome={'YES' if outcome else 'NO'} {ask_price_int}c "
+                    f"x{amount}): {e}"
+                )
+            else:
+                inv.reserve_pair(outcome, amount)
                 ask_order = ActiveOrder(
                     query_id=context.query_id,
                     outcome=outcome,
                     side="ask",
-                    price=ask_price_int,  # logical ASK price for should_update_orders
+                    price=ask_price_int,
                     amount=amount,
                     tracked_outcome=outcome,
                 )
                 placed_orders.append(ask_order)
+                if self._order_state is not None:
+                    self._order_state.track_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        is_buy=False,
+                        price=ask_price_int,
+                        amount=amount,
+                        is_inventory_backed=True,
+                    )
                 logger.info(
-                    f"Placed {'YES' if outcome else 'NO'} ask at {ask_price_int} "
-                    f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                    f"Inventory-backed {'YES' if outcome else 'NO'} ask "
+                    f"@{ask_price_int}c x{amount} on market {context.query_id} "
+                    f"(avail before/after: {available}/{available - amount}, "
+                    f"tx: {tx_hash[:16]}...)"
                 )
-            except Exception as e:
-                logger.error(f"Failed to place ask order: {e}")
+        else:
+            # Split-mint fallback. Mints fresh pair from collateral and
+            # lists both legs. Same shape as the pre-Phase-2 bot.
+            split_price = ask_price_int if outcome else (100 - ask_price_int)
+            ask_legs_ok = (
+                _meets_min_notional(split_price, amount)
+                and _meets_min_notional(100 - split_price, amount)
+            )
+            if not ask_legs_ok:
+                logger.info(
+                    f"Market {context.query_id}: skip {'YES' if outcome else 'NO'} ask "
+                    f"@{ask_price_int}c x{amount} (split_price={split_price}, one leg "
+                    f"falls below min notional {MIN_ORDER_NOTIONAL_CENT_SHARES}). "
+                    f"Order would silently revert."
+                )
+            else:
+                try:
+                    self.client.place_split_limit_order(
+                        query_id=context.query_id,
+                        true_price=split_price,
+                        amount=amount,
+                        wait=True,
+                    )
+                    tx_hash = self.client.place_sell_order(
+                        query_id=context.query_id,
+                        outcome=True,
+                        price=split_price,
+                        amount=amount,
+                        wait=True,
+                    )
+                    ask_order = ActiveOrder(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        side="ask",
+                        price=ask_price_int,  # logical ASK price
+                        amount=amount,
+                        tracked_outcome=outcome,
+                    )
+                    placed_orders.append(ask_order)
+                    if self._order_state is not None:
+                        self._order_state.track_order(
+                            query_id=context.query_id,
+                            outcome=outcome,
+                            is_buy=False,
+                            price=ask_price_int,
+                            amount=amount,
+                            is_inventory_backed=False,
+                        )
+                    logger.info(
+                        f"Placed {'YES' if outcome else 'NO'} ask at {ask_price_int} "
+                        f"for {amount} shares on market {context.query_id} "
+                        f"(split-mint, tx: {tx_hash[:16]}...)"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to place ask order: {e}")
 
         return placed_orders
 
@@ -807,6 +1062,19 @@ class LiquidityProviderBot:
     def run_once(self) -> None:
         """Run a single update cycle for all markets."""
         logger.debug("Running update cycle")
+        # Periodic inventory refresh from chain truth. Cheap enough to
+        # run on a coarse cadence; the bot tolerates a few cycles of
+        # stale inventory (overcounted reserved sells produce an empty
+        # available_for_sell, which just falls through to split-mint).
+        if (
+            self._cycles_since_inventory_refresh
+            >= max(1, self.config.inventory_refresh_interval_cycles)
+        ):
+            self._refresh_inventory()
+            self._cycles_since_inventory_refresh = 0
+        else:
+            self._cycles_since_inventory_refresh += 1
+
         self.update_all_markets()
 
         # Write JSON output after updating all markets
@@ -825,6 +1093,18 @@ class LiquidityProviderBot:
             f"Starting LP Bot [{mode}] with {len(self.markets)} markets, "
             f"alpha={self.config.alpha}, method={self.config.pricing_method.value}"
         )
+
+        # Bootstrap from chain truth before the first update cycle:
+        # 1) Pull positions to seed per-market inventory so the first
+        #    cycle's ASKs can prefer inventory-backed over fresh mints.
+        # 2) Reconcile persisted order state against chain so orders
+        #    placed in the previous session are re-managed and orphans
+        #    are dropped.
+        # Skipped entirely in read-only mode (no chain calls beyond
+        # what `update_all_markets` already does for snapshots).
+        if not self.read_only:
+            self._refresh_inventory()
+            self._reconcile_orders_on_startup()
 
         while self.running:
             try:
