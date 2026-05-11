@@ -20,6 +20,14 @@ class StreamConfig:
     min_order_size: int = 100  # Minimum order size in shares
     enabled: bool = True
     outcome_mode: str = "yes"  # "yes", "no", or "both"
+    # Optional per-market prior fair-YES probability in [0, 1]. When set and
+    # the order book is empty (no best_bid AND no best_ask), the bot uses
+    # `prior * 100` as the mid price instead of falling back to 50¢. Without
+    # this, a 1¢-prior market (e.g. Hormuz outcome 5) would quote YES bids
+    # in the [45, 55] range and hemorrhage capital to anyone willing to take
+    # them. Leave as None for symmetric markets where 50¢ is a sensible
+    # cold-start mid.
+    initial_probability: Optional[float] = None
 
     def __post_init__(self):
         if not 0 < self.bounds_pct < 1:
@@ -31,6 +39,11 @@ class StreamConfig:
             raise ValueError(
                 f"Invalid outcome_mode: {self.outcome_mode}. "
                 "Must be 'yes', 'no', or 'both'"
+            )
+        if self.initial_probability is not None and not (0.0 <= self.initial_probability <= 1.0):
+            raise ValueError(
+                f"Invalid initial_probability: {self.initial_probability}. "
+                "Must be in [0.0, 1.0] when set."
             )
 
     def calculate_bounds(self, mid_price: float) -> tuple[float, float]:

@@ -29,15 +29,49 @@ from .order_book import (
 logger = logging.getLogger(__name__)
 
 
+# Protocol minimum: orders below this notional (price_cents * amount) are
+# silently reverted on chain even though the SDK returns a tx hash. Guard
+# every place call with `_meets_min_notional()` to avoid tracking phantom
+# orders. Mirrors the MM bot's MIN_ORDER_NOTIONAL_CENT_SHARES constant.
+MIN_ORDER_NOTIONAL_CENT_SHARES = 100
+
+
+def _meets_min_notional(price: int, amount: int) -> bool:
+    """True if `price (cents) * amount (shares) >= protocol minimum`."""
+    return price * amount >= MIN_ORDER_NOTIONAL_CENT_SHARES
+
+
+def _derive_wallet_address(private_key: str) -> str:
+    """Return the 0x-prefixed checksum address for the given hex private key.
+
+    Used at client init to log which wallet the bot will sign as. A wrong
+    env-file deploy is otherwise silent — the SDK just signs against
+    whatever key it loaded.
+    """
+    from eth_account import Account
+    key = private_key.strip()
+    if not key.startswith("0x"):
+        key = "0x" + key
+    return Account.from_key(key).address
+
+
 @dataclass
 class ActiveOrder:
-    """Tracks an active order placed by the bot."""
+    """Tracks an active order placed by the bot.
+
+    For both bids and asks, `outcome` and `tracked_outcome` are the logical
+    outcome being quoted (YES or NO). For asks the on-chain shape is a
+    two-leg split-mint pair: a sell on `outcome` at `price` plus an
+    auto-listed sell on the opposite outcome at `100 - price`. The local
+    record stores the LOGICAL ask price so should_update_orders compares
+    against the right number on the next cycle.
+    """
     query_id: int
-    outcome: bool  # The outcome the order is tracked under (for asks: opposite of tracked_outcome)
+    outcome: bool  # Logical outcome this order quotes (YES or NO)
     side: str  # "bid" or "ask"
-    price: int  # SDK format (negative for bids, positive for asks)
+    price: int  # Logical price in cents. Bids stored negative (SDK convention); asks stored positive.
     amount: int
-    tracked_outcome: bool = True  # Which logical outcome this order belongs to (YES or NO)
+    tracked_outcome: bool = True  # Kept for backwards compat; equals `outcome` for all new orders.
 
 
 @dataclass
@@ -184,7 +218,14 @@ class LiquidityProviderBot:
                 )
             # Import here to avoid loading Go bindings until needed
             from trufnetwork_sdk_py.client import TNClient
-            logger.info(f"Initializing TNClient for {self.config.node_url}...")
+            # Derive and log the wallet address before any broadcast. A
+            # wrong-env-file deploy is otherwise silent: the bot just
+            # signs against whatever key is loaded. Last-line confirmation.
+            wallet_addr = _derive_wallet_address(token)
+            logger.info(
+                f"Initializing TNClient for {self.config.node_url} "
+                f"as wallet {wallet_addr} (read_only={self.read_only})"
+            )
             self._client = TNClient(
                 url=self.config.node_url,
                 token=token,
@@ -326,9 +367,24 @@ class LiquidityProviderBot:
             mid = market_state.mid_price
         elif market_state.best_bid is not None and market_state.best_ask is not None:
             mid = (market_state.best_bid + market_state.best_ask) / 2
+        elif stream_config.initial_probability is not None:
+            # No order book yet. Use the per-market prior so we don't
+            # quote a 1¢-prior market (Hormuz outcome 5 etc.) around 50¢.
+            mid = stream_config.initial_probability * 100.0
+            logger.info(
+                f"Market {market_state.query_id}: no order book, using "
+                f"initial_probability prior {mid:.2f}¢ as mid"
+            )
         else:
-            # Fallback to 50 if no market data
+            # Symmetric cold-start. Only safe for markets whose true fair
+            # value is genuinely near 50¢. For directional markets, set
+            # `initial_probability` on the StreamConfig.
             mid = 50.0
+            logger.warning(
+                f"Market {market_state.query_id}: no order book and no "
+                f"initial_probability set; falling back to mid=50.0. This "
+                f"is unsafe for directional markets (e.g. low-prior outcomes)."
+            )
 
         lower_bound, upper_bound = stream_config.calculate_bounds(mid)
 
@@ -385,9 +441,17 @@ class LiquidityProviderBot:
             return
 
         for order in orders_to_cancel:
+            # Track whether we can safely drop this from local state. A real
+            # RPC error must keep the order tracked so we don't lose chain
+            # visibility (the next reconcile/restart can sync state). "Order
+            # not found" is treated as success because chain has already lost
+            # it (settled, externally cancelled, etc.).
+            cancel_succeeded = True
             if order.side == "ask":
                 # Ask orders exist on both sides (split mint + sell).
-                # Cancel NO-side and YES-side asks.
+                # We track the LOGICAL ask (outcome, ask_price_int); the
+                # on-chain pair is at (outcome, ask_price) AND
+                # (not outcome, 100 - ask_price). Cancel both legs.
                 for cancel_outcome, cancel_price in [
                     (order.outcome, order.price),
                     (not order.outcome, 100 - order.price),
@@ -404,7 +468,8 @@ class LiquidityProviderBot:
                         if "order not found" in err_str or "old order not found" in err_str:
                             logger.debug(f"Order already gone for market {order.query_id}")
                         else:
-                            logger.warning(f"Failed to cancel ask order: {e}")
+                            logger.warning(f"Failed to cancel ask leg: {e}")
+                            cancel_succeeded = False
             else:
                 try:
                     self.client.cancel_order(
@@ -419,8 +484,16 @@ class LiquidityProviderBot:
                         logger.debug(f"Order already gone for market {order.query_id}")
                     else:
                         logger.warning(f"Failed to cancel bid order: {e}")
+                        cancel_succeeded = False
 
-            context.current_orders.remove(order)
+            if cancel_succeeded:
+                context.current_orders.remove(order)
+            else:
+                logger.warning(
+                    f"Keeping order in local state after cancel failure: "
+                    f"market={order.query_id} side={order.side} "
+                    f"outcome={order.outcome} price={order.price}"
+                )
 
     def place_orders(
         self,
@@ -511,65 +584,92 @@ class LiquidityProviderBot:
             return []
 
         # Place bid order on the specified outcome
-        try:
-            tx_hash = self.client.place_buy_order(
-                query_id=context.query_id,
-                outcome=outcome,
-                price=bid_price_int,
-                amount=amount,
-                wait=True,
-            )
-            bid_order = ActiveOrder(
-                query_id=context.query_id,
-                outcome=outcome,
-                side="bid",
-                price=-bid_price_int,  # SDK format
-                amount=amount,
-                tracked_outcome=outcome,
-            )
-            placed_orders.append(bid_order)
+        if not _meets_min_notional(bid_price_int, amount):
             logger.info(
-                f"Placed {'YES' if outcome else 'NO'} bid at {bid_price_int} "
-                f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                f"Market {context.query_id}: skip {'YES' if outcome else 'NO'} bid "
+                f"@{bid_price_int}c x{amount} (notional {bid_price_int * amount} < "
+                f"min {MIN_ORDER_NOTIONAL_CENT_SHARES}). Order would silently revert."
             )
-        except Exception as e:
-            logger.error(f"Failed to place bid order: {e}")
+        else:
+            try:
+                tx_hash = self.client.place_buy_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    price=bid_price_int,
+                    amount=amount,
+                    wait=True,
+                )
+                bid_order = ActiveOrder(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    side="bid",
+                    price=-bid_price_int,  # SDK format
+                    amount=amount,
+                    tracked_outcome=outcome,
+                )
+                placed_orders.append(bid_order)
+                logger.info(
+                    f"Placed {'YES' if outcome else 'NO'} bid at {bid_price_int} "
+                    f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to place bid order: {e}")
 
         # Place ask orders via split mint + sell.
-        # place_split_limit_order(true_price) mints pairs and sells NO at (100 - true_price).
-        # For YES asks: true_price = ask_price (sells NO at 100-ask, keeps YES)
-        # For NO asks: true_price = 100 - ask_price (sells NO at ask_price, keeps YES)
-        # Then place_sell_order sells the retained YES shares.
-        try:
-            split_price = ask_price_int if outcome else (100 - ask_price_int)
-            self.client.place_split_limit_order(
-                query_id=context.query_id,
-                true_price=split_price,
-                amount=amount,
-                wait=True,
-            )
-            tx_hash = self.client.place_sell_order(
-                query_id=context.query_id,
-                outcome=True,
-                price=split_price,
-                amount=amount,
-                wait=True,
-            )
-            ask_order = ActiveOrder(
-                query_id=context.query_id,
-                outcome=False,  # Split order lands on NO side
-                side="ask",
-                price=100 - split_price,  # NO side price where the split order sits
-                amount=amount,
-                tracked_outcome=outcome,
-            )
-            placed_orders.append(ask_order)
+        # place_split_limit_order(true_price) mints pairs and auto-lists the
+        # NO side at (100 - true_price). The bot then sells the retained YES
+        # shares via place_sell_order(outcome=True, price=true_price). For YES
+        # asks: split_price = ask_price (YES sell lands at ask_price). For NO
+        # asks: split_price = 100 - ask_price (auto-listed NO leg lands at
+        # ask_price). Both legs end up on-chain in either case; the bot tracks
+        # the LOGICAL ask (outcome, ask_price_int) so should_update_orders
+        # compares against the right price next cycle (previously the bot
+        # tracked the auto-listed NO leg's price, which made should_update
+        # trip every cycle on YES asks and silently re-mint fresh pairs).
+        split_price = ask_price_int if outcome else (100 - ask_price_int)
+        # Both legs must clear min-notional: the manual sell at split_price
+        # (which we'll log) and the auto-listed leg at 100 - split_price.
+        ask_legs_ok = (
+            _meets_min_notional(split_price, amount)
+            and _meets_min_notional(100 - split_price, amount)
+        )
+        if not ask_legs_ok:
             logger.info(
-                f"Placed {'YES' if outcome else 'NO'} ask at {ask_price_int} "
-                f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                f"Market {context.query_id}: skip {'YES' if outcome else 'NO'} ask "
+                f"@{ask_price_int}c x{amount} (split_price={split_price}, one leg "
+                f"falls below min notional {MIN_ORDER_NOTIONAL_CENT_SHARES}). "
+                f"Order would silently revert."
             )
-        except Exception as e:
-            logger.error(f"Failed to place ask order: {e}")
+        else:
+            try:
+                self.client.place_split_limit_order(
+                    query_id=context.query_id,
+                    true_price=split_price,
+                    amount=amount,
+                    wait=True,
+                )
+                tx_hash = self.client.place_sell_order(
+                    query_id=context.query_id,
+                    outcome=True,
+                    price=split_price,
+                    amount=amount,
+                    wait=True,
+                )
+                ask_order = ActiveOrder(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    side="ask",
+                    price=ask_price_int,  # logical ASK price for should_update_orders
+                    amount=amount,
+                    tracked_outcome=outcome,
+                )
+                placed_orders.append(ask_order)
+                logger.info(
+                    f"Placed {'YES' if outcome else 'NO'} ask at {ask_price_int} "
+                    f"for {amount} shares on market {context.query_id} (tx: {tx_hash[:16]}...)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to place ask order: {e}")
 
         return placed_orders
 
@@ -669,8 +769,19 @@ class LiquidityProviderBot:
             logger.error(f"Error updating market {query_id}: {e}")
 
     def update_all_markets(self) -> None:
-        """Update orders for all registered markets."""
+        """Update orders for all registered markets.
+
+        Honors a cooperative shutdown request: between each market we
+        check `self.running` so a SIGTERM received mid-cycle exits within
+        seconds rather than running the full pass to completion.
+        """
         for query_id, context in self.markets.items():
+            if not self.running:
+                logger.info(
+                    f"Shutdown requested mid-cycle; aborting after "
+                    f"{query_id} market boundary"
+                )
+                return
             mode = context.stream_config.outcome_mode
             outcomes = []
             if mode in ("yes", "both"):
