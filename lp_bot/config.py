@@ -101,6 +101,16 @@ class Config:
     # 100x apart in dollars. Leave as None to keep the fixed-share
     # behavior (`default_order_amount`). Mirrors the MM bot's
     # `order_dollar_amount`.
+    #
+    # IMPORTANT: `StreamConfig.min_order_size` (default 100) acts as a
+    # hard floor AFTER `_compute_base_amount` runs. With the defaults
+    # (`min_order_size=100`, `order_dollar_amount=$2`), an ASK at 99c
+    # rounds to 3 shares ($2.97 notional) then floors to 100 shares
+    # ($99 notional) — 33x more than the operator asked for. When
+    # using dollar-sizing on directional markets where extreme prices
+    # are routine (e.g. Hormuz outcome 5 at 1c-prior), operators MUST
+    # also lower `min_order_size` (e.g. to 1) per-market or the
+    # dollar-sizing will be silently overridden by the floor.
     order_dollar_amount: Optional[float] = None
 
     # Optional: maximum age (in seconds) any tracked order is allowed
