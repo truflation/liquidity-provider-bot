@@ -91,6 +91,18 @@ class Config:
     # Pre-settlement cutoff: pull all liquidity this many seconds before settle_time
     pre_settlement_cutoff: float = 900.0  # Default 15 minutes
 
+    # Persistent order state file. Lets the bot recover its tracked
+    # orders across restarts and reconcile against chain truth on
+    # startup. Skipped in read-only mode.
+    order_state_file: str = "lp_bot_order_state.json"
+
+    # Inventory refresh cadence. The bot calls `get_user_positions` and
+    # rebuilds per-market inventory every N update cycles. Lower values
+    # detect fills faster but cost more RPC bandwidth; higher values let
+    # the inventory cache go stale between refreshes. Mirrors the MM
+    # bot's 30s inventory refresh interval at a similar default cadence.
+    inventory_refresh_interval_cycles: int = 6
+
     # Pricing source for mid-price determination
     # "black_scholes" = always use B-S fair value from underlying stream data
     #                    (recommended when there are few market participants)
