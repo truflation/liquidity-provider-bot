@@ -140,6 +140,27 @@ class Config:
     # bot's 30s inventory refresh interval at a similar default cadence.
     inventory_refresh_interval_cycles: int = 6
 
+    # Minimum bid/ask spread floor in cents, enforced after pricing
+    # logic. Default 0.0 keeps the legacy behavior (only the 1c
+    # uncrossed-spread floor inside `ensure_uncrossed_spread`).
+    # Operators on markets where tight bounds can collapse the spread
+    # (low-mid markets where `bounds_pct * mid` is narrow) should set
+    # this to a more conservative value such as 3-6c. When the
+    # calculated spread is below the floor, the bot widens it
+    # symmetrically around the mid before placing. <= 0 disables.
+    min_spread_cents: float = 0.0
+
+    # Optional path to a heartbeat file the bot rewrites with the
+    # current unix timestamp on every main-loop iteration. A
+    # supervisor process (systemd, the MM orchestrator, etc.) can
+    # watch the file's mtime to detect a stuck-quiet bot. None
+    # disables heartbeat writes entirely (default — preserves the
+    # pre-Phase-3 behavior). The file's parent directory must exist
+    # and be writable; the bot logs a warning on the first write
+    # failure and stops retrying so a misconfigured path doesn't
+    # spam the log.
+    heartbeat_file: Optional[str] = None
+
     # === Pre-mint (OPTIONAL, disabled by default) ===
     # Hard wallet cap on the summed pre-mint collateral across all
     # markets. REQUIRED to enable pre-mint (set to None to keep
@@ -201,6 +222,11 @@ class Config:
         if self.max_order_age is not None and self.max_order_age <= 0:
             raise ValueError(
                 f"max_order_age must be > 0 when set, got {self.max_order_age}"
+            )
+
+        if self.min_spread_cents < 0:
+            raise ValueError(
+                f"min_spread_cents must be >= 0, got {self.min_spread_cents}"
             )
 
         # The pricing_source flag is documented as choosing between

@@ -17,12 +17,13 @@ inventory-backed path so `is_inventory_backed` is included for forward
 compatibility with Phase 2's inventory-aware ASKs.
 """
 
+import contextlib
 import json
 import logging
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,13 @@ class OrderStateManager:
     def __init__(self, state_file: str = "lp_bot_order_state.json") -> None:
         self.state_file = Path(state_file)
         self._orders: Dict[str, TrackedOrder] = {}
+        # Batched-save support. When `_batch_depth > 0` (inside a
+        # `with manager.batch():` block), track/untrack calls mark the
+        # state dirty but defer the actual file write. The batch exit
+        # flushes once if anything changed. Used to compress N writes
+        # per cancel-all loop into a single fsync.
+        self._batch_depth = 0
+        self._batch_dirty = False
         self._load_state()
 
     def _load_state(self) -> None:
@@ -95,7 +103,40 @@ class OrderStateManager:
             logger.error(f"Failed to load order state from {self.state_file}: {e}")
             self._orders = {}
 
+    @contextlib.contextmanager
+    def batch(self) -> Iterator["OrderStateManager"]:
+        """Suspend file writes inside this block; flush once at exit.
+
+        Reentrant. Multiple nested `with manager.batch():` blocks
+        still flush only once, on the outermost exit. If nothing
+        changed inside the block, no flush is performed.
+
+        Use this to wrap loops that call track_order or untrack_order
+        many times (cancel-all, reconcile-on-startup, etc.) so the
+        file is written once instead of N times.
+        """
+        self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._batch_dirty:
+                self._save_state_now()
+                self._batch_dirty = False
+
     def _save_state(self) -> None:
+        """Save unless we're inside a batch.
+
+        Inside a batch, marks state dirty and defers the actual write
+        to `batch()`'s flush at exit.
+        """
+        if self._batch_depth > 0:
+            self._batch_dirty = True
+            return
+        self._save_state_now()
+
+    def _save_state_now(self) -> None:
+        """Actually write the state file. Atomic via `.tmp` + replace."""
         try:
             data = {
                 "orders": [order.to_dict() for order in self._orders.values()],

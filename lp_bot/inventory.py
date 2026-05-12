@@ -119,12 +119,60 @@ class MarketInventory:
         chain_listed_yes_sells: int = 0,
         chain_listed_no_sells: int = 0,
     ) -> None:
-        """Overwrite held + listed counts from chain truth.
+        """Overwrite held + listed counts from chain truth, and release
+        any stale reservations against shares that have disappeared
+        due to fills (not cancels).
 
-        Reservation counters (reserved_*_sells) are bot-side state and
-        are NOT touched here, because a fresh chain snapshot does not
-        invalidate the bot's in-flight intent to list shares.
+        Diff math:
+          - `delta_listed_decrease` = how many listed shares vanished
+            since the last snapshot.
+          - `delta_held_increase` = how many shares appeared in held
+            since the last snapshot.
+          - A pure cancel converts listed -> held, so the two deltas
+            are equal and the difference is zero.
+          - A pure fill removes listed without any held increase (cash
+            goes to the wallet, not to held), so the difference equals
+            the fill count.
+          - A settlement removes both held and listed simultaneously;
+            held delta is negative (clamped to zero) and the fill
+            component still equals the lost listed amount.
+
+        We release `min(reserved, fill_delta)` so reservations track
+        actual on-chain commitments and `available_for_sell` doesn't
+        chronically under-report after fills accumulate. The
+        cancel path's explicit `release_pair` is the authoritative
+        cleanup for cancels; this is the fill-detection path that
+        the bot otherwise lacks.
         """
+        # Compute diffs against pre-update state BEFORE overwriting.
+        delta_yes_listed_decrease = max(0, self.chain_listed_yes_sells - chain_listed_yes_sells)
+        delta_no_listed_decrease = max(0, self.chain_listed_no_sells - chain_listed_no_sells)
+        delta_yes_held_increase = max(0, yes_shares - self.yes_shares)
+        delta_no_held_increase = max(0, no_shares - self.no_shares)
+
+        yes_fill_delta = max(0, delta_yes_listed_decrease - delta_yes_held_increase)
+        no_fill_delta = max(0, delta_no_listed_decrease - delta_no_held_increase)
+
+        if yes_fill_delta > 0 and self.reserved_yes_sells > 0:
+            release = min(self.reserved_yes_sells, yes_fill_delta)
+            self.reserved_yes_sells -= release
+            logger.info(
+                f"Market {self.query_id}: detected {yes_fill_delta} YES "
+                f"listed-share decrease without held-share increase "
+                f"(probable fill); released {release} reservations "
+                f"(reserved_yes_sells now {self.reserved_yes_sells})"
+            )
+        if no_fill_delta > 0 and self.reserved_no_sells > 0:
+            release = min(self.reserved_no_sells, no_fill_delta)
+            self.reserved_no_sells -= release
+            logger.info(
+                f"Market {self.query_id}: detected {no_fill_delta} NO "
+                f"listed-share decrease without held-share increase "
+                f"(probable fill); released {release} reservations "
+                f"(reserved_no_sells now {self.reserved_no_sells})"
+            )
+
+        # Overwrite chain truth.
         self.yes_shares = yes_shares
         self.no_shares = no_shares
         self.chain_listed_yes_sells = chain_listed_yes_sells
