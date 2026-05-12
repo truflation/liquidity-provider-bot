@@ -531,125 +531,125 @@ class LiquidityProviderBot:
         # markets with M tracked orders each would otherwise rewrite
         # the state file N*M times.
         with self._order_state.batch():
-         for query_id, context in self.markets.items():
-            # Bucket entries by (outcome, side). Side is determined by
-            # the SDK's signed-price convention (negative=bid, positive=ask).
-            # We keep these maps separate per (outcome, side) so a BID
-            # at price 30 cannot accidentally match an ASK at 30, and
-            # a YES-side entry cannot match a NO-side tracked order.
-            bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
-            asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
+            for query_id, context in self.markets.items():
+                # Bucket entries by (outcome, side). Side is determined by
+                # the SDK's signed-price convention (negative=bid, positive=ask).
+                # We keep these maps separate per (outcome, side) so a BID
+                # at price 30 cannot accidentally match an ASK at 30, and
+                # a YES-side entry cannot match a NO-side tracked order.
+                bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
+                asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
 
-            for ob_outcome in (True, False):
-                try:
-                    entries = self.client.get_order_book(query_id, ob_outcome)
-                except Exception as exc:
-                    logger.warning(
-                        f"Reconcile: get_order_book({query_id}, {ob_outcome}) "
-                        f"failed: {exc}. Treating outcome as empty."
-                    )
-                    continue
-                for entry in entries:
-                    owner = entry.get("wallet_address")
-                    if owner is None:
+                for ob_outcome in (True, False):
+                    try:
+                        entries = self.client.get_order_book(query_id, ob_outcome)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Reconcile: get_order_book({query_id}, {ob_outcome}) "
+                            f"failed: {exc}. Treating outcome as empty."
+                        )
                         continue
-                    if isinstance(owner, (bytes, bytearray)):
-                        owner_hex = "0x" + owner.hex()
+                    for entry in entries:
+                        owner = entry.get("wallet_address")
+                        if owner is None:
+                            continue
+                        if isinstance(owner, (bytes, bytearray)):
+                            owner_hex = "0x" + owner.hex()
+                        else:
+                            owner_hex = str(owner)
+                        if owner_hex.lower() != wallet_addr:
+                            continue
+                        raw_price = entry.get("price")
+                        amount = entry.get("amount", 0)
+                        if raw_price is None:
+                            continue
+                        if raw_price < 0:
+                            bids[ob_outcome][abs(raw_price)] = (
+                                bids[ob_outcome].get(abs(raw_price), 0) + amount
+                            )
+                        elif raw_price > 0:
+                            asks[ob_outcome][raw_price] = (
+                                asks[ob_outcome].get(raw_price, 0) + amount
+                            )
+
+                # Walk tracked orders for this market and decide active vs
+                # stale per side+outcome+is_inventory_backed semantics.
+                recovered_bids = 0
+                recovered_asks = 0
+                stale = 0
+                for tracked in self._order_state.get_market_orders(query_id):
+                    if tracked.is_buy:
+                        is_active = tracked.price in bids[tracked.outcome]
+                    elif tracked.is_inventory_backed:
+                        is_active = tracked.price in asks[tracked.outcome]
                     else:
-                        owner_hex = str(owner)
-                    if owner_hex.lower() != wallet_addr:
-                        continue
-                    raw_price = entry.get("price")
-                    amount = entry.get("amount", 0)
-                    if raw_price is None:
-                        continue
-                    if raw_price < 0:
-                        bids[ob_outcome][abs(raw_price)] = (
-                            bids[ob_outcome].get(abs(raw_price), 0) + amount
-                        )
-                    elif raw_price > 0:
-                        asks[ob_outcome][raw_price] = (
-                            asks[ob_outcome].get(raw_price, 0) + amount
+                        # Split-mint: either leg surviving means the pair
+                        # is still on chain. We cancelled BOTH legs on
+                        # success last session, so finding just one means
+                        # a partial cancel — caller will retry on the next
+                        # cycle's update.
+                        is_active = (
+                            tracked.price in asks[tracked.outcome]
+                            or (100 - tracked.price) in asks[not tracked.outcome]
                         )
 
-            # Walk tracked orders for this market and decide active vs
-            # stale per side+outcome+is_inventory_backed semantics.
-            recovered_bids = 0
-            recovered_asks = 0
-            stale = 0
-            for tracked in self._order_state.get_market_orders(query_id):
-                if tracked.is_buy:
-                    is_active = tracked.price in bids[tracked.outcome]
-                elif tracked.is_inventory_backed:
-                    is_active = tracked.price in asks[tracked.outcome]
-                else:
-                    # Split-mint: either leg surviving means the pair
-                    # is still on chain. We cancelled BOTH legs on
-                    # success last session, so finding just one means
-                    # a partial cancel — caller will retry on the next
-                    # cycle's update.
-                    is_active = (
-                        tracked.price in asks[tracked.outcome]
-                        or (100 - tracked.price) in asks[not tracked.outcome]
-                    )
+                    if not is_active:
+                        stale += 1
+                        self._order_state.untrack_order(
+                            tracked.query_id,
+                            tracked.outcome,
+                            tracked.is_buy,
+                            tracked.price,
+                        )
+                        continue
 
-                if not is_active:
-                    stale += 1
-                    self._order_state.untrack_order(
-                        tracked.query_id,
-                        tracked.outcome,
-                        tracked.is_buy,
-                        tracked.price,
-                    )
-                    continue
+                    # Recover into MarketContext so the main loop manages it.
+                    # `created_at` carries over from the persisted state so
+                    # `max_order_age` continues to count from the original
+                    # placement, not the recovery moment — an order that
+                    # was already stale at restart age-refreshes on the
+                    # first post-recovery cycle.
+                    if tracked.is_buy:
+                        order = ActiveOrder(
+                            query_id=query_id,
+                            outcome=tracked.outcome,
+                            side="bid",
+                            price=-tracked.price,
+                            amount=tracked.amount,
+                            tracked_outcome=tracked.outcome,
+                            is_inventory_backed=False,
+                            created_at=tracked.created_at,
+                        )
+                        recovered_bids += 1
+                    else:
+                        order = ActiveOrder(
+                            query_id=query_id,
+                            outcome=tracked.outcome,
+                            side="ask",
+                            price=tracked.price,
+                            amount=tracked.amount,
+                            tracked_outcome=tracked.outcome,
+                            is_inventory_backed=tracked.is_inventory_backed,
+                            created_at=tracked.created_at,
+                        )
+                        recovered_asks += 1
+                        # Seed the reservation for inventory-backed asks.
+                        # The held count was just refreshed from chain truth
+                        # via `_refresh_inventory()`; without seeding the
+                        # reservation, `available_for_sell` would over-count
+                        # by `tracked.amount` and the next cycle would
+                        # double-list against the same shares.
+                        if tracked.is_inventory_backed:
+                            inv = self._inventory.get_market_inventory(query_id)
+                            inv.reserve_pair(tracked.outcome, tracked.amount)
+                    context.current_orders.append(order)
 
-                # Recover into MarketContext so the main loop manages it.
-                # `created_at` carries over from the persisted state so
-                # `max_order_age` continues to count from the original
-                # placement, not the recovery moment — an order that
-                # was already stale at restart age-refreshes on the
-                # first post-recovery cycle.
-                if tracked.is_buy:
-                    order = ActiveOrder(
-                        query_id=query_id,
-                        outcome=tracked.outcome,
-                        side="bid",
-                        price=-tracked.price,
-                        amount=tracked.amount,
-                        tracked_outcome=tracked.outcome,
-                        is_inventory_backed=False,
-                        created_at=tracked.created_at,
+                if recovered_bids or recovered_asks or stale:
+                    logger.info(
+                        f"Reconcile market {query_id}: "
+                        f"{recovered_bids} bids + {recovered_asks} asks recovered, "
+                        f"{stale} stale dropped"
                     )
-                    recovered_bids += 1
-                else:
-                    order = ActiveOrder(
-                        query_id=query_id,
-                        outcome=tracked.outcome,
-                        side="ask",
-                        price=tracked.price,
-                        amount=tracked.amount,
-                        tracked_outcome=tracked.outcome,
-                        is_inventory_backed=tracked.is_inventory_backed,
-                        created_at=tracked.created_at,
-                    )
-                    recovered_asks += 1
-                    # Seed the reservation for inventory-backed asks.
-                    # The held count was just refreshed from chain truth
-                    # via `_refresh_inventory()`; without seeding the
-                    # reservation, `available_for_sell` would over-count
-                    # by `tracked.amount` and the next cycle would
-                    # double-list against the same shares.
-                    if tracked.is_inventory_backed:
-                        inv = self._inventory.get_market_inventory(query_id)
-                        inv.reserve_pair(tracked.outcome, tracked.amount)
-                context.current_orders.append(order)
-
-            if recovered_bids or recovered_asks or stale:
-                logger.info(
-                    f"Reconcile market {query_id}: "
-                    f"{recovered_bids} bids + {recovered_asks} asks recovered, "
-                    f"{stale} stale dropped"
-                )
 
     def _pre_mint_all_markets(self) -> None:
         """One-time split-mint pass to bring each market up to its
