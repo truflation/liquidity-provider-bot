@@ -29,6 +29,16 @@ class StreamConfig:
     # cold-start mid.
     initial_probability: Optional[float] = None
 
+    # Pre-mint inventory target (number of YES+NO pairs to hold at startup).
+    # When set AND the bot's `pre_mint_max_total_collateral_usd` cap is also
+    # set, the bot will split-mint up to (target - paired_inventory()) fresh
+    # pairs per market at startup so subsequent ASKs can be inventory-backed
+    # instead of fresh-minted every cycle. Each pair costs $1 of collateral.
+    # Leave as None to keep the bot in lazy-mint mode for this market.
+    # Mirrors the MM bot's `initial_mint_pairs` field and the public market-
+    # maker-bot#6 opt-in documentation.
+    initial_mint_pairs: Optional[int] = None
+
     def __post_init__(self):
         if not 0 < self.bounds_pct < 1:
             raise ValueError(
@@ -84,12 +94,82 @@ class Config:
     # Order parameters
     default_order_amount: int = 100  # Default shares per order
 
+    # Optional: size each leg by a target DOLLAR notional rather than a
+    # fixed share count. When set, the bot computes per-leg shares as
+    # `ceil(order_dollar_amount * 100 / price_cents)` so a $2 BID at 1c
+    # and a $2 ASK at 99c both end up around $2 notional rather than
+    # 100x apart in dollars. Leave as None to keep the fixed-share
+    # behavior (`default_order_amount`). Mirrors the MM bot's
+    # `order_dollar_amount`.
+    #
+    # IMPORTANT: `StreamConfig.min_order_size` (default 100) acts as a
+    # hard floor AFTER `_compute_base_amount` runs. With the defaults
+    # (`min_order_size=100`, `order_dollar_amount=$2`), an ASK at 99c
+    # rounds to 3 shares ($2.97 notional) then floors to 100 shares
+    # ($99 notional) — 33x more than the operator asked for. When
+    # using dollar-sizing on directional markets where extreme prices
+    # are routine (e.g. Hormuz outcome 5 at 1c-prior), operators MUST
+    # also lower `min_order_size` (e.g. to 1) per-market or the
+    # dollar-sizing will be silently overridden by the floor.
+    order_dollar_amount: Optional[float] = None
+
+    # Optional: maximum age (in seconds) any tracked order is allowed
+    # to live before the bot forces a refresh even if the price has
+    # not moved past the `should_update_orders` threshold. Catches
+    # stuck-quiet regressions where prices stop refreshing and orders
+    # stay glued to a stale book. None disables age-based forcing
+    # (default — preserves the pre-existing behavior).
+    max_order_age: Optional[float] = None
+
     # Scheduler parameters
     block_interval_seconds: float = 2.0  # Approximate block time
     check_interval_seconds: float = 5.0  # How often to check for new blocks
 
     # Pre-settlement cutoff: pull all liquidity this many seconds before settle_time
     pre_settlement_cutoff: float = 900.0  # Default 15 minutes
+
+    # Persistent order state file. Lets the bot recover its tracked
+    # orders across restarts and reconcile against chain truth on
+    # startup. Skipped in read-only mode.
+    order_state_file: str = "lp_bot_order_state.json"
+
+    # Inventory refresh cadence. The bot calls `get_user_positions` and
+    # rebuilds per-market inventory every N update cycles. Lower values
+    # detect fills faster but cost more RPC bandwidth; higher values let
+    # the inventory cache go stale between refreshes. Mirrors the MM
+    # bot's 30s inventory refresh interval at a similar default cadence.
+    inventory_refresh_interval_cycles: int = 6
+
+    # === Pre-mint (OPTIONAL, disabled by default) ===
+    # Hard wallet cap on the summed pre-mint collateral across all
+    # markets. REQUIRED to enable pre-mint (set to None to keep
+    # pre-mint disabled even if individual markets have
+    # `initial_mint_pairs` set). Sized in dollars; each pair = $1
+    # collateral. Pre-mint aborts startup if the summed deficit would
+    # exceed this. None disables pre-mint entirely.
+    pre_mint_max_total_collateral_usd: Optional[float] = None
+
+    # `true_price` passed to place_split_limit_order during pre-mint.
+    # The SDK auto-lists the NO leg at `100 - true_price`, so
+    # `true_price=1` parks the auto-listed NO at 99c — significantly
+    # less likely to fill than the bot's intended price. Not an
+    # absolute guarantee (a counterparty willing to pay 99c can still
+    # take it) but reduces leak risk if the follow-up cancel fails.
+    pre_mint_listing_price_yes_cents: int = 1
+
+    # Pre-mint mint-cushion multiplier. Applied when sizing per-market
+    # `initial_mint_pairs` from your planned book. 1.0 = mint exactly
+    # what you plan to ASK; >1.0 = oversize for refill headroom.
+    # Currently informational only (caller sets `initial_mint_pairs`
+    # directly); reserved for future config_generator integration.
+    mint_cushion_multiplier: float = 1.0
+
+    # Safety buffer added to `pre_settlement_cutoff` when deciding
+    # whether to skip pre-mint for a market near settlement. Mints
+    # within `pre_settlement_cutoff + pre_mint_settlement_buffer`
+    # seconds of settling are skipped so the bot doesn't burn pair
+    # collateral on a market it's about to pull liquidity from.
+    pre_mint_settlement_buffer: float = 300.0
 
     # Pricing source for mid-price determination
     # "black_scholes" = always use B-S fair value from underlying stream data
@@ -103,6 +183,25 @@ class Config:
     def __post_init__(self):
         if not 0 <= self.alpha <= 1:
             raise ValueError(f"alpha must be in [0, 1], got {self.alpha}")
+
+        # Pre-mint park price must be in (0, 100). 0 and 100 produce
+        # auto-listed legs at 100 and 0 respectively, both nonsensical.
+        if not (1 <= self.pre_mint_listing_price_yes_cents <= 99):
+            raise ValueError(
+                f"pre_mint_listing_price_yes_cents must be in [1, 99], "
+                f"got {self.pre_mint_listing_price_yes_cents}"
+            )
+
+        if self.order_dollar_amount is not None and self.order_dollar_amount <= 0:
+            raise ValueError(
+                f"order_dollar_amount must be > 0 when set, "
+                f"got {self.order_dollar_amount}"
+            )
+
+        if self.max_order_age is not None and self.max_order_age <= 0:
+            raise ValueError(
+                f"max_order_age must be > 0 when set, got {self.max_order_age}"
+            )
 
         # The pricing_source flag is documented as choosing between
         # B-S fair value and order-book mid, but no code consumes it
