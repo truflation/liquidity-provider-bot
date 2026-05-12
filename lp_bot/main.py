@@ -202,12 +202,20 @@ def create_config_from_args(args: argparse.Namespace) -> Config:
 
 
 def setup_signal_handlers(bot) -> None:
-    """Setup graceful shutdown on SIGINT/SIGTERM."""
+    """Setup graceful shutdown on SIGINT/SIGTERM.
+
+    Cooperative: the handler only flips `bot.running` to False. The main
+    loop notices on its next iteration boundary (or between markets via
+    the in-cycle check) and exits cleanly. Cleanup runs from main()'s
+    `finally: bot.stop()`. Calling `bot.stop()` directly from a signal
+    handler is brittle: long cancel loops can be interrupted mid-RPC,
+    `sys.exit(0)` may never fire if a cancel raises, and re-entrancy on
+    SIGTERM-during-cancel can leave the supervisor waiting on a SIGKILL.
+    """
 
     def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, shutting down...")
-        bot.stop()
-        sys.exit(0)
+        logger.info(f"Received signal {signum}, requesting shutdown...")
+        bot.running = False
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
