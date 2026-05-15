@@ -1261,17 +1261,34 @@ class LiquidityProviderBot:
         threshold: float = 1.0,
     ) -> bool:
         """
-        Determine if orders should be updated based on price change OR age.
+        Determine if orders should be updated based on price change, age,
+        or a missing expected side.
 
-        Returns True iff at least one tracked order has either:
-          - moved enough that the new bid/ask differs from the recorded
-            price by >= `threshold` cents, OR
-          - aged past `config.max_order_age` seconds (when set).
+        Returns True iff at least one of the following holds:
+          - a tracked order moved enough that the new bid/ask differs
+            from the recorded price by >= `threshold` cents,
+          - a tracked order has aged past `config.max_order_age` seconds
+            (when set), or
+          - the tracked set is missing either `bid` or `ask` for this
+            outcome (e.g. one leg failed to place on a gateway flap and
+            the surviving leg's price is still within band, so the
+            other two checks would say "no update needed" until
+            `max_order_age` expires up to 30 min later).
 
         The age branch catches stuck-quiet regressions where prices
         stop refreshing and orders stay glued to a stale book. Without
         it, a bot that stops getting fills and observes no price moves
         would never refresh.
+
+        The missing-side branch catches partial-place failures: an ask
+        that hit `code = -900` once stays missing until age forces a
+        refresh, which can be up to `max_order_age` seconds away. It
+        also catches the silent-skip case where `_meets_min_notional`
+        blocks placement of a leg (e.g. a split-mint mirror leg with
+        a near-0 or near-100 cent price). To avoid cancel+replace
+        churn on chronic skip/failure, the branch is rate-limited by
+        `config.missing_side_retry_cooldown` (seconds since youngest
+        tracked order was placed).
         """
         if not current_orders:
             return True
@@ -1303,6 +1320,41 @@ class LiquidityProviderBot:
                         f"(>= max_order_age={max_age:.0f}s)"
                     )
                     return True
+
+        sides_present = {o.side for o in current_orders}
+        if "bid" not in sides_present or "ask" not in sides_present:
+            # Cooldown: only retry missing-side once per
+            # `missing_side_retry_cooldown` seconds, keyed off the youngest
+            # surviving order's `created_at`. This caps cancel+replace
+            # churn when the missing leg keeps failing — e.g. a gateway
+            # `code = -900` storm, or a leg below `_meets_min_notional`
+            # that gets silently skipped every cycle. Without the cap,
+            # `check_interval_seconds=5` produces ~3 TXs every 5s for as
+            # long as the failure persists.
+            cooldown = self.config.missing_side_retry_cooldown
+            if cooldown > 0:
+                # `max(created_at)` already handles the sentinel `0` case
+                # (manually-constructed ActiveOrder with no real placement
+                # timestamp): if every tracked order has `created_at == 0`,
+                # max is 0, `youngest_age` becomes effectively the current
+                # unix time, and the cooldown check naturally fails through
+                # to the refresh. An earlier guard keyed off
+                # `current_orders[0].created_at` was ordering-dependent
+                # and could bypass cooldown entirely when the first order
+                # had the sentinel but others had real timestamps.
+                youngest_age = time.time() - max(
+                    o.created_at for o in current_orders
+                )
+                if youngest_age < cooldown:
+                    return False
+            missing = {"bid", "ask"} - sides_present
+            sample = current_orders[0]
+            logger.warning(
+                f"Forcing refresh: missing side(s) {sorted(missing)} on "
+                f"market {sample.query_id} outcome={sample.outcome} "
+                f"(have {sorted(sides_present)})"
+            )
+            return True
 
         return False
 

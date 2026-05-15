@@ -121,8 +121,14 @@ class OrderStateManager:
         finally:
             self._batch_depth -= 1
             if self._batch_depth == 0 and self._batch_dirty:
-                self._save_state_now()
-                self._batch_dirty = False
+                # Only clear the dirty flag if the flush actually wrote.
+                # `_save_state_now()` swallows write errors and returns
+                # False on failure; preserving `_batch_dirty=True` on
+                # failure lets the next mutation retry the write rather
+                # than silently leaving the file stale until something
+                # else triggers a flush.
+                if self._save_state_now():
+                    self._batch_dirty = False
 
     def _save_state(self) -> None:
         """Save unless we're inside a batch.
@@ -135,8 +141,16 @@ class OrderStateManager:
             return
         self._save_state_now()
 
-    def _save_state_now(self) -> None:
-        """Actually write the state file. Atomic via `.tmp` + replace."""
+    def _save_state_now(self) -> bool:
+        """Actually write the state file. Atomic via `.tmp` + replace.
+
+        Returns True on a successful write, False if the I/O raised
+        (and the error was logged). The return value lets batched
+        flush logic decide whether to clear the dirty flag: a True
+        return means the on-disk state matches memory and the dirty
+        flag can be cleared; a False return means the next mutation
+        should retry the write.
+        """
         try:
             data = {
                 "orders": [order.to_dict() for order in self._orders.values()],
@@ -149,8 +163,10 @@ class OrderStateManager:
             logger.debug(
                 f"Saved {len(self._orders)} tracked orders to {self.state_file}"
             )
+            return True
         except Exception as e:
             logger.error(f"Failed to save order state: {e}")
+            return False
 
     def track_order(
         self,

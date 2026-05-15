@@ -121,6 +121,16 @@ class Config:
     # (default — preserves the pre-existing behavior).
     max_order_age: Optional[float] = None
 
+    # Minimum interval (seconds) between consecutive "missing-side"
+    # refreshes for the same (market, outcome). After a place failure
+    # leaves only one side tracked, `should_update_orders` triggers a
+    # cancel+replace burst to recover the missing leg; this cooldown
+    # caps the burst rate so a chronically failing leg (gateway flap,
+    # `_meets_min_notional` skip, persistent insufficient balance)
+    # does not churn at every `check_interval_seconds`. 0.0 disables
+    # the cooldown (refresh every cycle when a side is missing).
+    missing_side_retry_cooldown: float = 60.0
+
     # Scheduler parameters
     block_interval_seconds: float = 2.0  # Approximate block time
     check_interval_seconds: float = 5.0  # How often to check for new blocks
@@ -222,6 +232,12 @@ class Config:
         if self.max_order_age is not None and self.max_order_age <= 0:
             raise ValueError(
                 f"max_order_age must be > 0 when set, got {self.max_order_age}"
+            )
+
+        if self.missing_side_retry_cooldown < 0:
+            raise ValueError(
+                f"missing_side_retry_cooldown must be >= 0, "
+                f"got {self.missing_side_retry_cooldown}"
             )
 
         if self.min_spread_cents < 0:
