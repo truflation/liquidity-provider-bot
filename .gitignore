@@ -41,6 +41,14 @@ Thumbs.db
 .env
 .env.local
 
+# Deployment-specific YAML configs (config.example.yaml IS tracked).
+# Operators should copy config.example.yaml to config.<env>.yaml and
+# fill in their values; those files often carry market-specific tuning
+# and stream IDs that are deployment private.
+config.mainnet.yaml
+config.testnet.yaml
+config.local.yaml
+
 # Output files
 lp_bot_orders.json
 *.json

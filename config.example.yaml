@@ -1,0 +1,153 @@
+# LP Bot Configuration — Example
+#
+# Copy this file to `config.<environment>.yaml` and edit the values for
+# your deployment. Deployment-specific files (config.mainnet.yaml,
+# config.testnet.yaml) are gitignored.
+#
+# Load with:
+#   python -m lp_bot.main --config config.<environment>.yaml
+#
+# YAML values are merged with environment defaults. CLI flags (--alpha,
+# --debug, --dry-run, etc.) layer on top of whatever the YAML provides.
+
+# =============================================================================
+# Network connection
+# =============================================================================
+
+# TrufNetwork gateway URL. Mainnet uses gateway.mainnet.truf.network;
+# testnet uses gateway.testnet.truf.network.
+node_url: "https://gateway.testnet.truf.network"
+
+# Wallet private key for placing orders. Leave blank to load from the
+# TRUF_PRIVATE_KEY (or TRUF_API_TOKEN) environment variable. Keeping
+# the YAML free of secrets makes it safe to check in.
+api_token: ""
+
+# =============================================================================
+# Pricing
+# =============================================================================
+
+# "equal" (default) or "volume" (volume-weighted with optional time decay).
+pricing_method: "equal"
+
+# Risk tolerance: 0=aggressive (quote near best), 1=passive (quote near
+# bounds). 0.30 is a reasonable starting point for a low-liquidity book.
+alpha: 0.30
+
+# Pricing source. Only "black_scholes" is implemented today.
+pricing_source: "black_scholes"
+
+# =============================================================================
+# Order sizing
+# =============================================================================
+
+# Default fallback share count when `order_dollar_amount` is unset.
+default_order_amount: 100
+
+# Target dollar notional per leg. With `order_dollar_amount: 2.0`, a 1c
+# BID posts ~200 shares and a 99c ASK posts ~3 shares; both target ~$2.
+# Comment out to fall back to fixed-share sizing.
+# CAUTION: `StreamConfig.min_order_size` (default 100) floors the share
+# count AFTER dollar-sizing — leave `min_order_size` unset (or set to
+# 1) in markets where extreme prices are routine.
+# order_dollar_amount: 2.0
+
+# =============================================================================
+# Order lifecycle
+# =============================================================================
+
+# Force-refresh tracked orders whose `created_at` is older than this many
+# seconds, even when the price has not moved. Catches stuck-quiet
+# regressions on a degraded gateway. Comment out to disable.
+# max_order_age: 1800.0
+
+# Per-(market, outcome) cooldown for missing-side refreshes. When a
+# place_orders cycle leaves only a bid or only an ask tracked, the
+# bot retries the missing leg this many seconds later. Lower values
+# recover faster from transient gateway flaps; higher values bound
+# the cancel+replace churn on chronic failures.
+missing_side_retry_cooldown: 60.0
+
+# Minimum spread floor (cents) enforced after pricing. The bot widens
+# the spread symmetrically around the mid when the calculated spread
+# is below this floor.
+min_spread_cents: 3.0
+
+# Pull all liquidity this many seconds before a market settles.
+pre_settlement_cutoff: 900.0
+
+# =============================================================================
+# Scheduler / cadence
+# =============================================================================
+
+# How often (seconds) the main loop iterates each registered market.
+check_interval_seconds: 5.0
+
+# How often (in update cycles) the bot calls `get_user_positions` to
+# rebuild per-market inventory. Lower values detect fills faster but
+# cost more RPC bandwidth.
+inventory_refresh_interval_cycles: 6
+
+# =============================================================================
+# Persistence
+# =============================================================================
+
+# Path the bot rewrites with the current unix timestamp on every
+# main-loop iteration. A systemd supervisor can watch mtime to detect a
+# stuck-quiet bot. Comment out to disable heartbeat writes.
+# heartbeat_file: "/var/run/lp_bot/heartbeat"
+
+# Persistent JSON file for the bot's tracked-orders state. Used by
+# reconcile-on-startup to match local state against chain truth.
+order_state_file: "lp_bot_order_state.json"
+
+# =============================================================================
+# Pre-mint (opt-in, disabled by default)
+# =============================================================================
+
+# Hard wallet cap (USD) on the summed pre-mint collateral across all
+# registered markets. REQUIRED to enable pre-mint; comment out to keep
+# pre-mint disabled. The bot aborts startup if the per-market deficits
+# sum above this cap.
+# pre_mint_max_total_collateral_usd: 50.0
+
+# `true_price` (cents) for the auto-listed mirror leg during pre-mint.
+# 1 parks the auto-listed NO leg at 99c, minimizing fill risk during the
+# narrow window before the bot's own ASK overwrites it.
+pre_mint_listing_price_yes_cents: 1
+
+# =============================================================================
+# Markets to register
+# =============================================================================
+
+# Each entry binds a query_id (the on-chain market identifier) to a
+# StreamConfig (per-market pricing knobs). The bot registers each at
+# startup via `bot.register_market(entry.query_id, entry.stream)`.
+markets:
+  # Example: a single binary market.
+  - query_id: 1
+    stream_id: "stEXAMPLEEXAMPLEEXAMPLEEXAMPLE0001"
+    name: "Example market"
+
+    # Bounds as fraction of mid (0.10 = ±10%). Required.
+    bounds_pct: 0.10
+
+    # Hard floor on the per-order share count. Set to 1 if you use
+    # `order_dollar_amount` and operate on markets where extreme
+    # prices are routine.
+    min_order_size: 1
+
+    # "yes", "no", or "both". Controls which side(s) the bot quotes.
+    outcome_mode: "both"
+
+    enabled: true
+
+    # Optional: prior fair-YES probability in [0, 1]. When the order
+    # book is empty, the bot uses `initial_probability * 100` as the
+    # mid price. Leave unset for symmetric markets where 50c is a
+    # sensible cold-start mid.
+    # initial_probability: 0.50
+
+    # Optional: pre-mint target (YES+NO pairs to hold at startup).
+    # Effective only when `pre_mint_max_total_collateral_usd` is set.
+    # initial_mint_pairs: 20

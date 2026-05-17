@@ -313,6 +313,19 @@ def get_default_streams() -> list[StreamConfig]:
     ]
 
 
+@dataclass
+class MarketEntry:
+    """A (query_id, StreamConfig) pair as loaded from a YAML deploy file.
+
+    The bot's `register_market(query_id, stream_config)` API takes the two
+    separately; bundling them here lets a YAML-driven deploy carry the
+    full registration in a single list entry rather than two parallel
+    lists. Mirrors the MM bot's `MarketConfig` shape.
+    """
+    query_id: int
+    stream: StreamConfig
+
+
 def load_config_from_env() -> Config:
     """Load configuration from environment variables."""
     import os
@@ -334,3 +347,234 @@ def load_config_from_env() -> Config:
         config.target_depth_pct = float(os.getenv("LP_BOT_TARGET_DEPTH", "0.30"))
 
     return config
+
+
+# Whitelist of top-level YAML keys consumed by `load_config_from_dict`.
+# Kept separate from the `Config` dataclass field list because (a) `markets`
+# lives at the top level of YAML but is returned alongside Config rather
+# than stored on it, and (b) we want explicit failure on typos like
+# `node_ul:` rather than silently dropping them. Update this set when
+# adding a new YAML-tunable Config field.
+_KNOWN_TOP_LEVEL_KEYS = {
+    "node_url",
+    "api_token",
+    "use_sample_data",
+    "pricing_method",
+    "pricing_source",
+    "alpha",
+    "target_depth_pct",
+    "apply_time_decay",
+    "half_life_seconds",
+    "default_order_amount",
+    "order_dollar_amount",
+    "max_order_age",
+    "missing_side_retry_cooldown",
+    "block_interval_seconds",
+    "check_interval_seconds",
+    "pre_settlement_cutoff",
+    "order_state_file",
+    "inventory_refresh_interval_cycles",
+    "min_spread_cents",
+    "heartbeat_file",
+    "pre_mint_max_total_collateral_usd",
+    "pre_mint_listing_price_yes_cents",
+    "mint_cushion_multiplier",
+    "pre_mint_settlement_buffer",
+    "markets",
+}
+
+# Whitelist of per-market YAML keys consumed by `load_config_from_dict`.
+# `query_id` is plucked into `MarketEntry`; the rest are passed to
+# StreamConfig. Update this set when adding a new YAML-tunable
+# StreamConfig field.
+_KNOWN_MARKET_KEYS = {
+    "query_id",
+    "stream_id",
+    "name",
+    "bounds_pct",
+    "min_order_size",
+    "enabled",
+    "outcome_mode",
+    "initial_probability",
+    "initial_mint_pairs",
+}
+
+
+def load_config_from_dict(data: dict) -> tuple[Config, list[MarketEntry]]:
+    """Load Config + registered markets from a parsed YAML/JSON dict.
+
+    Returns (config, markets). The caller is responsible for iterating
+    `markets` and invoking `bot.register_market(entry.query_id,
+    entry.stream)` once the bot is constructed. We keep them separate
+    rather than stuffing the entries onto `Config.streams` so the
+    distinction between "schema-default fallback streams" (kept on
+    Config.streams) and "operator-requested registrations" (returned
+    here) stays clear.
+
+    Unknown keys at the top level OR inside a market entry raise
+    `ValueError` rather than being silently dropped. A typo like
+    `nod_url:` should fail loudly, not run the bot on the wrong URL.
+    `api_token`, when blank in the YAML, falls back to
+    `TRUF_PRIVATE_KEY` and then `TRUF_API_TOKEN` (MM-bot-style) so
+    the deployable YAML can stay free of secrets.
+    """
+    import os
+
+    unknown_top = set(data.keys()) - _KNOWN_TOP_LEVEL_KEYS
+    if unknown_top:
+        raise ValueError(
+            f"Unknown top-level config key(s): {sorted(unknown_top)}. "
+            f"Allowed keys: {sorted(_KNOWN_TOP_LEVEL_KEYS)}"
+        )
+
+    # Map pricing_method string -> enum; accept None / missing.
+    method_raw = data.get("pricing_method")
+    if method_raw is None:
+        pricing_method = PricingMethod.EQUAL_WEIGHTED
+    else:
+        try:
+            pricing_method = PricingMethod(method_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid pricing_method {method_raw!r}. Must be one of "
+                f"{[m.value for m in PricingMethod]}"
+            ) from exc
+
+    raw_api_token = data.get("api_token", "")
+    if raw_api_token is not None and not isinstance(raw_api_token, str):
+        raise ValueError(
+            f"api_token must be a string (or null/missing for env fallback), "
+            f"got {type(raw_api_token).__name__}: {raw_api_token!r}"
+        )
+    api_token = raw_api_token or ""
+    if not api_token:
+        api_token = (
+            os.environ.get("TRUF_PRIVATE_KEY")
+            or os.environ.get("TRUF_API_TOKEN")
+            or ""
+        )
+
+    def _typed(key: str, default, caster):
+        """Pull `key` from `data`, coerce via `caster`, or return default.
+
+        Wraps the per-field cast so a YAML mistyping (`alpha: "0.3"`
+        with quotes, `default_order_amount: 100.0` as float, etc.)
+        surfaces as a typed `ValueError` naming the offending key
+        rather than a downstream `TypeError` from a comparison or
+        an int-vs-float type leak into the bot.
+        """
+        if key not in data or data[key] is None:
+            return default
+        value = data[key]
+        try:
+            return caster(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"config key {key!r}={value!r}: expected "
+                f"{caster.__name__}, got {type(value).__name__} ({e})"
+            )
+
+    # Build Config from explicit keys. Each numeric/bool/path field is
+    # coerced through `_typed` so a YAML mistyping (e.g. `alpha: "0.3"`)
+    # raises a typed `ValueError` naming the offending key instead of
+    # leaking a `TypeError` from a comparison three frames downstream.
+    # `str` fields are pulled with `.get` directly because PyYAML's
+    # safe_load yields `str` for unquoted bareword values too.
+    config = Config(
+        node_url=data.get("node_url", "https://gateway.testnet.truf.network"),
+        api_token=api_token,
+        use_sample_data=_typed("use_sample_data", False, bool),
+        pricing_method=pricing_method,
+        alpha=_typed("alpha", 0.30, float),
+        target_depth_pct=_typed("target_depth_pct", 0.30, float),
+        apply_time_decay=_typed("apply_time_decay", False, bool),
+        half_life_seconds=_typed("half_life_seconds", 60.0, float),
+        default_order_amount=_typed("default_order_amount", 100, int),
+        order_dollar_amount=_typed("order_dollar_amount", None, float),
+        max_order_age=_typed("max_order_age", None, float),
+        missing_side_retry_cooldown=_typed(
+            "missing_side_retry_cooldown", 60.0, float
+        ),
+        block_interval_seconds=_typed("block_interval_seconds", 2.0, float),
+        check_interval_seconds=_typed("check_interval_seconds", 5.0, float),
+        pre_settlement_cutoff=_typed("pre_settlement_cutoff", 900.0, float),
+        order_state_file=data.get("order_state_file", "lp_bot_order_state.json"),
+        inventory_refresh_interval_cycles=_typed(
+            "inventory_refresh_interval_cycles", 6, int
+        ),
+        min_spread_cents=_typed("min_spread_cents", 0.0, float),
+        heartbeat_file=data.get("heartbeat_file"),
+        pre_mint_max_total_collateral_usd=_typed(
+            "pre_mint_max_total_collateral_usd", None, float
+        ),
+        pre_mint_listing_price_yes_cents=_typed(
+            "pre_mint_listing_price_yes_cents", 1, int
+        ),
+        mint_cushion_multiplier=_typed("mint_cushion_multiplier", 1.0, float),
+        pre_mint_settlement_buffer=_typed(
+            "pre_mint_settlement_buffer", 300.0, float
+        ),
+        pricing_source=data.get("pricing_source", "black_scholes"),
+    )
+    # Suppress the default-streams fallback. Config.__post_init__ replaces
+    # an empty `streams=` with `get_default_streams()` (six testnet entries)
+    # so passing `streams=[]` to the constructor would NOT keep the list
+    # empty. Wipe it AFTER __post_init__ runs so YAML-driven deploys do
+    # not carry a phantom testnet-stream list. Market registration goes
+    # through the returned MarketEntry list, not Config.streams.
+    config.streams = []
+
+    markets: list[MarketEntry] = []
+    for idx, raw in enumerate(data.get("markets") or []):
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"markets[{idx}] must be a mapping, got {type(raw).__name__}"
+            )
+        unknown_market = set(raw.keys()) - _KNOWN_MARKET_KEYS
+        if unknown_market:
+            raise ValueError(
+                f"markets[{idx}]: unknown key(s) {sorted(unknown_market)}. "
+                f"Allowed keys: {sorted(_KNOWN_MARKET_KEYS)}"
+            )
+        if "query_id" not in raw:
+            raise ValueError(f"markets[{idx}]: missing required key 'query_id'")
+        if "stream_id" not in raw or "name" not in raw:
+            raise ValueError(
+                f"markets[{idx}]: missing required key(s) "
+                f"(need at least 'stream_id' and 'name')"
+            )
+        query_id = int(raw["query_id"])
+        stream_kwargs = {k: v for k, v in raw.items() if k != "query_id"}
+        try:
+            stream = StreamConfig(**stream_kwargs)
+        except TypeError as exc:
+            raise ValueError(
+                f"markets[{idx}] (query_id={query_id}): StreamConfig "
+                f"rejected the supplied keys: {exc}"
+            ) from exc
+        markets.append(MarketEntry(query_id=query_id, stream=stream))
+
+    return config, markets
+
+
+def load_config_from_yaml(path: str) -> tuple[Config, list[MarketEntry]]:
+    """Load Config + market entries from a YAML file path.
+
+    Thin wrapper around `load_config_from_dict`: opens the file with
+    `yaml.safe_load` (no arbitrary tag execution), then delegates. Raises
+    `FileNotFoundError` if the path does not exist and `ValueError` if
+    the YAML parses but is structurally invalid.
+    """
+    import yaml
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"LP config file not found: {path}")
+    with open(p, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"LP config at {path} must parse to a mapping, got {type(data).__name__}"
+        )
+    return load_config_from_dict(data)
