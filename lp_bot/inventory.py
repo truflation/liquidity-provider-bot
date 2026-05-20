@@ -126,16 +126,23 @@ class MarketInventory:
         Diff math:
           - `delta_listed_decrease` = how many listed shares vanished
             since the last snapshot.
-          - `delta_held_increase` = how many shares appeared in held
-            since the last snapshot.
-          - A pure cancel converts listed -> held, so the two deltas
-            are equal and the difference is zero.
-          - A pure fill removes listed without any held increase (cash
-            goes to the wallet, not to held), so the difference equals
-            the fill count.
-          - A settlement removes both held and listed simultaneously;
-            held delta is negative (clamped to zero) and the fill
-            component still equals the lost listed amount.
+          - We treat any listed-share decrease as a probable fill and
+            cap the released reservations by `min(reserved, fill_delta)`.
+            The cap is the safety net: if the listed-decrease was
+            actually a cancel that already released its reservation
+            via `release_pair` (cancel path), the cap returns 0 and
+            nothing changes. If a cancel landed on chain but the
+            in-memory release was skipped (rare crash window), the cap
+            still catches up by releasing the stale reservation here.
+          - A previous version of this routine subtracted the
+            held-share increase from the listed decrease to try to
+            distinguish fill vs cancel. That zeroed out `fill_delta`
+            when a split-mint or other transfer-in happened in the
+            same refresh window as a real ask fill, so genuine fills
+            stayed un-released. The straight listed-decrease form
+            combined with the `min(reserved, ...)` cap handles all
+            three cases (pure fill, pure cancel, simultaneous mint+fill)
+            without that masking.
 
         We release `min(reserved, fill_delta)` so reservations track
         actual on-chain commitments and `available_for_sell` doesn't
@@ -147,11 +154,9 @@ class MarketInventory:
         # Compute diffs against pre-update state BEFORE overwriting.
         delta_yes_listed_decrease = max(0, self.chain_listed_yes_sells - chain_listed_yes_sells)
         delta_no_listed_decrease = max(0, self.chain_listed_no_sells - chain_listed_no_sells)
-        delta_yes_held_increase = max(0, yes_shares - self.yes_shares)
-        delta_no_held_increase = max(0, no_shares - self.no_shares)
 
-        yes_fill_delta = max(0, delta_yes_listed_decrease - delta_yes_held_increase)
-        no_fill_delta = max(0, delta_no_listed_decrease - delta_no_held_increase)
+        yes_fill_delta = delta_yes_listed_decrease
+        no_fill_delta = delta_no_listed_decrease
 
         if yes_fill_delta > 0 and self.reserved_yes_sells > 0:
             release = min(self.reserved_yes_sells, yes_fill_delta)
