@@ -2,5 +2,8 @@
 # Install from source: pip install git+https://github.com/trufnetwork/sdk-py.git
 # Or build locally with Python 3.12 and Go 1.22+
 
+# YAML config file loader (used by `python -m lp_bot.main --config <path>`)
+PyYAML>=6.0
+
 # Optional: For key generation
 eth-account>=0.8.0

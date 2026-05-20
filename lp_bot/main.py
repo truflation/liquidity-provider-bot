@@ -20,7 +20,14 @@ import signal
 import sys
 from typing import Optional
 
-from .config import Config, StreamConfig, PricingMethod, load_config_from_env
+from .config import (
+    Config,
+    StreamConfig,
+    MarketEntry,
+    PricingMethod,
+    load_config_from_env,
+    load_config_from_yaml,
+)
 
 
 # Configure logging
@@ -76,14 +83,14 @@ Examples:
     parser.add_argument(
         "--half-life",
         type=float,
-        default=60.0,
-        help="Half-life in seconds for time decay. Default: 60",
+        default=None,
+        help="Half-life in seconds for time decay. Default: 60.0 (None = use YAML/config default)",
     )
     parser.add_argument(
         "--target-depth",
         type=float,
-        default=0.30,
-        help="Target depth %% for VWAP calculation. Default: 0.30",
+        default=None,
+        help="Target depth %% for VWAP calculation. Default: 0.30 (None = use YAML/config default)",
     )
     parser.add_argument(
         "--order-amount",
@@ -94,8 +101,8 @@ Examples:
     parser.add_argument(
         "--interval",
         type=float,
-        default=5.0,
-        help="Check interval in seconds. Default: 5.0",
+        default=None,
+        help="Check interval in seconds. Default: 5.0 (None = use YAML/config default)",
     )
     parser.add_argument(
         "--output", "-o",
@@ -134,6 +141,18 @@ Examples:
         action="store_true",
         help="Auto-discover active (non-settled) markets from the network",
     )
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help=(
+            "Path to YAML config file. When supplied, takes precedence over "
+            "--query-ids and --discover-markets for market selection, and "
+            "supplies all Config fields. CLI overrides (--alpha, --debug, "
+            "--dry-run, etc.) still apply on top of the YAML values."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -168,9 +187,27 @@ def generate_key() -> None:
         print(f"  export TRUF_API_TOKEN='{key}'")
 
 
-def create_config_from_args(args: argparse.Namespace) -> Config:
-    """Create configuration from command line arguments and environment."""
-    config = load_config_from_env()
+def create_config_from_args(
+    args: argparse.Namespace,
+) -> tuple[Config, list[MarketEntry]]:
+    """Create configuration from command line arguments and environment.
+
+    Returns (config, market_entries). `market_entries` is non-empty
+    only when --config is supplied AND its YAML contains a `markets:`
+    list; otherwise the caller falls back to --query-ids /
+    --discover-markets handling.
+
+    Precedence:
+      1. YAML file (when --config is supplied) supplies all Config
+         fields and may carry market entries.
+      2. Environment variables fill the Config when no --config.
+      3. CLI flags layer on top of either (1) or (2).
+    """
+    market_entries: list[MarketEntry] = []
+    if getattr(args, "config", None):
+        config, market_entries = load_config_from_yaml(args.config)
+    else:
+        config = load_config_from_env()
 
     # Override with command line arguments
     if args.alpha is not None:
@@ -186,19 +223,29 @@ def create_config_from_args(args: argparse.Namespace) -> Config:
     if args.time_decay:
         config.apply_time_decay = True
 
-    if args.half_life != 60.0:
+    if args.half_life is not None:
         config.half_life_seconds = args.half_life
 
-    if args.target_depth != 0.30:
+    if args.target_depth is not None:
         config.target_depth_pct = args.target_depth
 
     if args.order_amount is not None:
         config.default_order_amount = args.order_amount
 
-    config.check_interval_seconds = args.interval
-    config.use_sample_data = args.sample_data
+    # All numeric overrides use `default=None` in argparse so that
+    # passing the same value as the Config default still registers as
+    # an explicit override (an operator running `--interval 5.0` to be
+    # explicit will not be silently ignored).
+    if args.interval is not None:
+        config.check_interval_seconds = args.interval
+    # `--sample-data` (action="store_true") can only set True; there is
+    # no symmetric way to force False from the CLI. Operators who need
+    # to override a YAML-set `use_sample_data: true` must edit the
+    # YAML or unset the field there.
+    if args.sample_data:
+        config.use_sample_data = True
 
-    return config
+    return config, market_entries
 
 
 def setup_signal_handlers(bot) -> None:
@@ -233,6 +280,35 @@ def register_example_markets(bot) -> None:
         "  Example: python -m lp_bot.main --query-ids 38,39,40 --dry-run\n"
         "  Example: python -m lp_bot.main --discover-markets --dry-run"
     )
+
+
+def register_market_entries(bot, entries: list[MarketEntry]) -> None:
+    """
+    Register markets parsed from a YAML config.
+
+    Each entry carries a query_id and a fully-populated StreamConfig
+    (bounds_pct, min_order_size, outcome_mode, initial_probability,
+    initial_mint_pairs, etc.). No defaults are applied here so the
+    YAML stays the single source of truth for per-market knobs.
+
+    Entries with `enabled: false` are skipped (logged at INFO) so an
+    operator can keep a market in the YAML for documentation but pause
+    quoting on it without deleting the entry.
+    """
+    for entry in entries:
+        if not entry.stream.enabled:
+            logger.info(
+                f"Skipping market {entry.query_id} ({entry.stream.name!r}): "
+                f"enabled=false in YAML"
+            )
+            continue
+        logger.info(
+            f"Registering market {entry.query_id} "
+            f"(stream_id={entry.stream.stream_id!r}, "
+            f"outcome_mode={entry.stream.outcome_mode!r}, "
+            f"bounds_pct={entry.stream.bounds_pct})"
+        )
+        bot.register_market(entry.query_id, entry.stream)
 
 
 def register_query_ids(bot, query_ids: list[int]) -> None:
@@ -290,7 +366,7 @@ def main() -> None:
         logging.getLogger("lp_bot").setLevel(logging.DEBUG)
 
     # Create configuration
-    config = create_config_from_args(args)
+    config, market_entries = create_config_from_args(args)
 
     logger.info("=" * 60)
     logger.info("TRUF Network Liquidity Provider Bot")
@@ -348,8 +424,13 @@ def main() -> None:
     # Setup signal handlers for graceful shutdown
     setup_signal_handlers(bot)
 
-    # Register markets based on CLI args
-    if args.query_ids:
+    # Register markets. Precedence: YAML `markets:` > --query-ids >
+    # --discover-markets > the empty-list warning. YAML wins so an
+    # operator running `lp_bot.main --config <path>` does not have to
+    # also pass --query-ids and then risk drift between the two.
+    if market_entries:
+        register_market_entries(bot, market_entries)
+    elif args.query_ids:
         try:
             query_ids = [int(x.strip()) for x in args.query_ids.split(",")]
         except ValueError:
