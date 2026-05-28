@@ -150,6 +150,22 @@ class Config:
     # bot's 30s inventory refresh interval at a similar default cadence.
     inventory_refresh_interval_cycles: int = 6
 
+    # Periodic on-chain orphan reconcile cadence, measured in main-loop
+    # cycles. 1 cycle = 1 full sweep through all configured markets
+    # (`run_once`), which on 35 markets at the default 5s `check_interval_seconds`
+    # plus ~5s per market work takes roughly 5-7 minutes. So
+    # reconcile_interval_cycles=1 means "reconcile once per sweep".
+    # When > 0, the reconcile detects both directions of drift between
+    # local tracked state and the on-chain order book:
+    #   - tracked-but-not-on-chain  -> untrack locally (same as the
+    #     existing startup reconcile)
+    #   - on-chain-but-not-tracked  -> CANCEL the orphan
+    # The orphan-cancel direction is the fix for the known cancel-then-
+    # place silent-failure race in the update path. 0 disables (default,
+    # opt-in for safety so existing deployments do not change behavior).
+    # Recommended starting value: 1 (every sweep) for sustained deploy.
+    reconcile_interval_cycles: int = 0
+
     # Minimum bid/ask spread floor in cents, enforced after pricing
     # logic. Default 0.0 keeps the legacy behavior (only the 1c
     # uncrossed-spread floor inside `ensure_uncrossed_spread`).
@@ -374,6 +390,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "pre_settlement_cutoff",
     "order_state_file",
     "inventory_refresh_interval_cycles",
+    "reconcile_interval_cycles",
     "min_spread_cents",
     "heartbeat_file",
     "pre_mint_max_total_collateral_usd",
@@ -502,6 +519,7 @@ def load_config_from_dict(data: dict) -> tuple[Config, list[MarketEntry]]:
         inventory_refresh_interval_cycles=_typed(
             "inventory_refresh_interval_cycles", 6, int
         ),
+        reconcile_interval_cycles=_typed("reconcile_interval_cycles", 0, int),
         min_spread_cents=_typed("min_spread_cents", 0.0, float),
         heartbeat_file=data.get("heartbeat_file"),
         pre_mint_max_total_collateral_usd=_typed(
