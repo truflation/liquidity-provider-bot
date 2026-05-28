@@ -195,6 +195,22 @@ def test_reconcile_cap_caps_first_pass_at_20():
     assert bot.client.cancel_order.call_count == 20
 
 
+def test_reconcile_continues_on_get_order_book_rpc_failure():
+    """A gateway RPC failure on get_order_book for one (qid, outcome)
+    must NOT abort the whole pass. The catch-and-continue contract
+    keeps reconcile from going dark on a single transient flap."""
+    qid = 100
+    bot = _bot_mock(
+        tracked_orders=[],
+        order_books={(qid, True): [], (qid, False): []},
+    )
+    bot.client.get_order_book.side_effect = RuntimeError("gateway 503")
+
+    LiquidityProviderBot._periodic_reconcile_against_chain(bot)
+
+    bot.client.cancel_order.assert_not_called()
+
+
 def test_reconcile_untracks_stale_local_entries():
     qid = 100
     bot = _bot_mock(
