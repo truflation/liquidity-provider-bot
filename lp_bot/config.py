@@ -152,9 +152,10 @@ class Config:
 
     # Periodic on-chain orphan reconcile cadence, measured in main-loop
     # cycles. 1 cycle = 1 full sweep through all configured markets
-    # (`run_once`), which on 35 markets at the default 5s `check_interval_seconds`
-    # plus ~5s per market work takes roughly 5-7 minutes. So
-    # reconcile_interval_cycles=1 means "reconcile once per sweep".
+    # (`run_once`). Sweep duration scales with market count + per-market
+    # work and ranges from seconds (a few markets) to several minutes
+    # (tens of markets). reconcile_interval_cycles=1 means "reconcile
+    # once per sweep".
     # When > 0, the reconcile detects both directions of drift between
     # local tracked state and the on-chain order book:
     #   - tracked-but-not-on-chain  -> untrack locally (same as the
